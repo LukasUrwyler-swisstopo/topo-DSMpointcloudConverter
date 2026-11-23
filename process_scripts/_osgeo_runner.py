@@ -10,6 +10,9 @@ Aktionen:
     process - ASCII (xyz) oder LAZ/LAS (beliebiges Tiling / gemergt) -> LAZ/LAS-Kacheln gemaess
               Grid-Shape (TileKey aus Attributfeld 'NAME'), CRS-Tag nach Auswahl, optional
               Thinning und DSM-Raster + Hillshade, siehe Kommentar ueber _process()
+    raster  - ASCII-DSM eines Gebiets (ESRI-ASCII-Grid, XYZ-Gitter oder XYZ-Punkte) direkt ->
+              DSM-Raster + Hillshade fuer den GDWH-Import SB_DSM, ohne Kacheln,
+              siehe Kommentar ueber _process_raster()
 """
 
 import base64
@@ -26,8 +29,11 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-ASCII_EXTENSIONS = (".xyz", ".txt", ".asc", ".csv")
+ASCII_EXTENSIONS = (".xyz", ".txt", ".asc", ".ascii", ".csv")
 LAS_EXTENSIONS   = (".laz", ".las")
+# Kopf eines ESRI-ASCII-Grids (AAIGrid, Gross-/Kleinschreibung egal)
+ESRI_HEADER_KEYS = ("ncols", "nrows", "xllcorner", "xllcenter", "yllcorner", "yllcenter",
+                    "cellsize", "dx", "dy", "nodata_value")
 
 # Trennzeichen: GUI-Schluessel -> Zeichen fuer readers.text
 SEPARATORS = {"space": " ", "tab": "\t", "comma": ",", "semicolon": ";"}
@@ -168,8 +174,13 @@ def _log(msg: str) -> None:
     print(msg, flush=True)
 
 
+# Batch: jeder Lauf meldet 0..1, abgebildet auf seinen Anteil am Gesamtbalken (start, spanne)
+_PROGRESS_RANGE = [0.0, 1.0]
+
+
 def _progress(fraction: float) -> None:
-    print(f"PROGRESS:{max(0.0, min(1.0, fraction)):.6f}", flush=True)
+    value = _PROGRESS_RANGE[0] + _PROGRESS_RANGE[1] * max(0.0, min(1.0, fraction))
+    print(f"PROGRESS:{value:.6f}", flush=True)
 
 
 def _fmt_count(n) -> str:
@@ -499,9 +510,10 @@ def _sniff_ascii(path: str, max_lines: int = 50) -> dict:
                 lines.append(line.rstrip("\r\n"))
     if not lines:
         raise ValueError(f"Datei ist leer: {path}")
-    if lines[0].split()[0].lower() in ("ncols", "nrows", "xllcorner", "xllcenter"):
+    if lines[0].split()[0].lower() in ESRI_HEADER_KEYS:
         raise ValueError(f"{os.path.basename(path)} ist ein ESRI-ASCII-Grid (Raster mit ncols/nrows-Kopf), "
-                         "keine XYZ-Punktliste - z.B. mit 'gdal_translate -of XYZ' umwandeln.")
+                         "keine XYZ-Punktliste - fuer DSM-Raster den Tab 'DSM.ascii -> DSM-Raster' verwenden, "
+                         "fuer LAZ-Kacheln zuerst mit 'gdal_translate -of XYZ' umwandeln.")
 
     skip = 0
     for line in lines:
@@ -729,6 +741,12 @@ def _cells_of_bbox(minx, miny, maxx, maxy, size: float) -> set:
 
 def _info(cfg: dict) -> None:
     """Analysiert den Input-Ordner und gibt das Ergebnis als JSON-Zeile auf stdout aus."""
+    if cfg.get("format") == "raster":
+        if cfg.get("batch_list"):
+            _raster_batch_info(cfg)
+        else:
+            _raster_info(cfg)
+        return
     input_dir = cfg["input_dir"]
     grid_size = float(cfg.get("grid_size") or 1000.0)
     if not os.path.isdir(input_dir):
@@ -887,13 +905,17 @@ def _las_writer(filename: str, point_format: int, offset=(0.0, 0.0, 0.0), srs="E
 def _ascii_to_laz_worker(args) -> tuple:
     """ASCII -> Zwischen-LAZ (scale 0.01, offset 0 -> dasselbe Zentimeter-Gitter wie die
     Endkacheln mit Offset = Kachelursprung, die Requantisierung dort ist eine Identitaet).
+    drop_nodata (nur Raster-Tab): Punkte mit Z <= -9999 (NoData-Platzhalter) verwerfen.
     Rueckgabe: (quelle, ziel, punktzahl, anzahl_ignorierter_zeilen)."""
-    src, dst, pipeline_path, pdal_exe, columns, sep_key, skip, point_format = args
+    src, dst, pipeline_path, pdal_exe, columns, sep_key, skip, point_format, drop_nodata = args
     sep = SEPARATORS[sep_key]
-    reader = {"type": "readers.text", "filename": src, "separator": sep,
-              "header": sep.join(columns), "skip": int(skip)}
+    stages = [{"type": "readers.text", "filename": src, "separator": sep,
+               "header": sep.join(columns), "skip": int(skip)}]
+    if drop_nodata:
+        stages.append({"type": "filters.range", "limits": f"Z({GRID_NODATA_SENTINEL:g}:]"})
+    stages.append(_las_writer(dst, point_format))
     try:
-        out = _run_pipeline(pdal_exe, [reader, _las_writer(dst, point_format)], pipeline_path)
+        out = _run_pipeline(pdal_exe, stages, pipeline_path)
     finally:
         _discard(pipeline_path)
     # readers.text ueberspringt unpassende Zeilen nur mit Warnung (Exit-Code 0) -
@@ -903,8 +925,57 @@ def _ascii_to_laz_worker(args) -> tuple:
     if count == 0:
         first = out.splitlines()[0] if out else ""
         raise ValueError(f"0 Punkte gelesen - Spalten '{' '.join(columns)}' / Trennzeichen passen "
-                         f"nicht zur Datei. PDAL: {first[:300]}")
+                         f"nicht zur Datei" + (" (oder nur NoData-Hoehen)" if drop_nodata else "")
+                         + f". PDAL: {first[:300]}")
     return src, dst, count, ignored
+
+
+def _ascii_to_laz_all(files: list, read_fmt: dict, run_dir: Path, pdal_exe: str, workers: int,
+                      chunk_bytes: int, point_format: int, p0: float, pspan: float,
+                      drop_nodata: bool = False) -> tuple:
+    """Schritt 'ASCII -> LAZ' beider ASCII-Wege (Kacheln, Raster aus Punkten): jede Datei ->
+    Zwischen-LAZ, grosse Dateien vorher an Zeilengrenzen in Teile zerlegt und parallel gelesen.
+    read_fmt: {datei: (spalten, trennzeichen, kopfzeilen)}.
+    Rueckgabe: (sortierte Zwischen-LAZ, {zwischen_laz: input_datei})."""
+    names = {f: os.path.basename(f) for f in files}
+    tmp_dir = run_dir / "a"
+    tmp_dir.mkdir(exist_ok=True)
+    jobs = []   # (teil_oder_datei, input_datei, kopfzeilen)
+    for i, f in enumerate(files):
+        skip = read_fmt[f][2]
+        size_b = os.path.getsize(f)
+        n_parts = min(workers, -(-size_b // chunk_bytes)) if workers > 1 else 1
+        if n_parts > 1:
+            parts = _split_ascii(f, run_dir / "c" / f"{i:05d}", n_parts)
+            _log(f"  {names[f]}: {size_b / 1024 ** 2:,.0f} MB -> {len(parts)} Teile (paralleles Einlesen)")
+            jobs += [(p, f, skip if k == 0 else 0) for k, p in enumerate(parts)]
+        else:
+            jobs.append((f, f, skip))
+    sources, failed, origin_of = [], [], {}
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = {ex.submit(_ascii_to_laz_worker,
+                          (src, str(tmp_dir / f"s{j:05d}.laz"), tmp_dir / f"p{j:05d}.json", pdal_exe,
+                           read_fmt[orig][0], read_fmt[orig][1], sk, point_format, drop_nodata)): (src, orig)
+                for j, (src, orig, sk) in enumerate(jobs)}
+        for done, fut in enumerate(as_completed(futs), 1):
+            src, orig = futs[fut]
+            label = names[orig] + (f" [{os.path.basename(src)}]" if src != orig else "")
+            try:
+                _, dst, count, ignored = fut.result()
+                sources.append(dst)
+                origin_of[dst] = orig
+                _log(f"  [{done}/{len(jobs)}] {label}: {_fmt_count(count)} Punkte"
+                     + (f"  - WARNUNG: {ignored} Zeile(n) ignoriert (Spaltenzahl)" if ignored else ""))
+            except Exception as e:
+                failed.append(label)
+                _log(f"  [{done}/{len(jobs)}] {label}: FEHLER - {e}")
+            finally:
+                if src != orig:
+                    _discard(src)   # Teildatei sofort freigeben (Platz im Staging)
+            _progress(p0 + pspan * done / len(jobs))
+    if failed:
+        raise RuntimeError(f"{len(failed)} ASCII-Datei(en)/Teil(e) nicht lesbar - Abbruch.")
+    return sorted(sources), origin_of
 
 
 def _split_worker(args) -> tuple:
@@ -1255,16 +1326,17 @@ def _mask_hillshade_by_dsm(hs_path: str, dsm_path: str) -> int:
 
 def _build_dsm_raster(tile_paths: list, raster_dir: str, jahr: str, area: str, gsd: float,
                       height_ref: str, work_dir: Path, workers: int, pdal_exe: str,
-                      p0: float, pspan: float) -> tuple:
+                      p0: float, pspan: float, names: tuple = None) -> tuple:
     """DSM (Float32, NoData -FLT_MAX, CRS LV95 + Hoehe) und Hillshade (Byte, NoData 255,
-    CRS LV95) aus den fertigen Kacheln. Rueckgabe: (dsm_pfad, hillshade_pfad)."""
+    CRS LV95) aus den fertigen Kacheln. names: (DSM, Hillshade), Standard _raster_names().
+    Rueckgabe: (dsm_pfad, hillshade_pfad)."""
     import math
     from osgeo import gdal, osr
     gdal.UseExceptions()
     osr.UseExceptions()
 
     srs_compound = f"EPSG:2056+{HEIGHT_REFS[height_ref]}"
-    dsm_name, hs_name = _raster_names(jahr, area, gsd, height_ref)
+    dsm_name, hs_name = names or _raster_names(jahr, area, gsd, height_ref)
     dsm_path = os.path.join(raster_dir, dsm_name)
     hs_path = os.path.join(raster_dir, hs_name)
     Path(raster_dir).mkdir(parents=True, exist_ok=True)
@@ -1312,22 +1384,35 @@ def _build_dsm_raster(tile_paths: list, raster_dir: str, jahr: str, area: str, g
     raw_hs = work_dir / "hillshade_raw.tif"
     filled = _fill_raster_nodata(vrt_path, work_dir, gsd, str(workers), str(raw_hs))
     _progress(p0 + pspan * 0.8)
+    _finish_rasters(filled, str(raw_hs), dsm_path, hs_path, snap, gsd, height_ref, workers)
+    _progress(p0 + pspan)
+    return dsm_path, hs_path
 
+
+def _finish_rasters(src_dsm: str, raw_hs: str, dsm_path: str, hs_path: str, bounds: tuple,
+                    gsd: float, height_ref: str, workers: int) -> None:
+    """Gemeinsamer Abschluss aller Raster-Wege: DSM aus src_dsm (Float32, NoData CELL_NODATA)
+    mit NoData -FLT_MAX und CRS LV95 + Hoehe schreiben, Hillshade aus raw_hs (gdaldem) mit
+    255 = NoData, wo das DSM NoData ist, danach Kontrolle. Beide mit .tfw."""
+    from osgeo import gdal
+    gdal.UseExceptions()
+    srs_compound = f"EPSG:2056+{HEIGHT_REFS[height_ref]}"
     for p in (dsm_path, hs_path):
         for side in (p, os.path.splitext(p)[0] + ".tfw", p + ".aux.xml"):
             if os.path.isfile(side):
                 _log(f"  vorhanden, wird ueberschrieben: {os.path.basename(side)}")
                 _discard(side)
 
-    common = dict(format="GTiff", outputBounds=snap, xRes=gsd, yRes=gsd, multithread=True,
+    common = dict(format="GTiff", outputBounds=bounds, xRes=gsd, yRes=gsd, multithread=True,
                   warpOptions=[f"NUM_THREADS={workers}"])
-    # Quelle = Ziel-CRS: es wird nichts reprojiziert und keine Hoehe umgerechnet, nur getaggt
-    gdal.Warp(dsm_path, filled, options=gdal.WarpOptions(
+    # Quelle = Ziel-CRS und Ziel-Gitter = Quell-Gitter: es wird nichts reprojiziert, nicht
+    # resampelt und keine Hoehe umgerechnet, nur NoData umgesetzt und getaggt
+    gdal.Warp(dsm_path, src_dsm, options=gdal.WarpOptions(
         srcSRS=srs_compound, dstSRS=srs_compound, srcNodata=CELL_NODATA, dstNodata=RASTER_NODATA,
         creationOptions=RASTER_OUT_CO + ["PREDICTOR=3"], **common)).FlushCache()
 
-    n_clamped = _prepare_hillshade_values(str(raw_hs))
-    hs_ds = gdal.Warp(hs_path, str(raw_hs), options=gdal.WarpOptions(
+    n_clamped = _prepare_hillshade_values(raw_hs)
+    hs_ds = gdal.Warp(hs_path, raw_hs, options=gdal.WarpOptions(
         srcSRS="EPSG:2056", dstSRS="EPSG:2056", dstNodata=HILLSHADE_NODATA,
         creationOptions=RASTER_OUT_CO + ["PREDICTOR=2"], **common))
     hs_ds.GetRasterBand(1).SetUnitType("")   # Grauwert, keine Einheit (erbt sonst 'metre')
@@ -1361,8 +1446,852 @@ def _build_dsm_raster(tile_paths: list, raster_dir: str, jahr: str, area: str, g
         raise RuntimeError("Raster-Kontrolle fehlgeschlagen:\n  " + "\n  ".join(problems))
     _log(f"  Kontrolle OK: NoData DSM {RASTER_NODATA:g} / Hillshade {HILLSHADE_NODATA}, "
          f"CRS '{dsm_label}', Gitter deckungsgleich")
-    _progress(p0 + pspan)
-    return dsm_path, hs_path
+
+
+# ─── ASCII-DSM -> DSM-Raster + Hillshade fuer SB_DSM (Aktion 'raster') ─────────
+# Ein Gebiet (alle ASCII-Dateien eines Ordners = EIN Mosaik) direkt zu DSM + Hillshade, ohne
+# LAZ-Kacheln. Ziel: der GDWH-Import (topo-GDWHimport, GDS 'SB_DSM') nimmt beide ohne Nacharbeit
+# an - DSM Float32 / NoData -FLT_MAX / EPSG:2056+5728, Hillshade Byte / 255 / EPSG:2056.
+# Hoehenbezug fix LN02: SB_DSM kennt nur LV95_LN02, der Import bricht bei LHN95 ab
+# (topo-GDWHimport/processingScripts/_tiff_crs.py, decide_crs_action).
+SBDSM_HEIGHT_REF = "LN02"
+# Namensmuster 1:1 aus topo-GDWHimport (GUI_GDWHimport.NAME_FORMAT_SPECS['SB_DSM'])
+SBDSM_NAME_PATTERNS = (
+    re.compile(r'^20\d{2}_.+_DSM_.*_LV95_LN02\.(tif|tiff|tfw)$', re.IGNORECASE),
+    re.compile(r'^20\d{2}_.+_hillshade_.*_LV95_LN02\.(tif|tiff)$', re.IGNORECASE),
+)
+# Namensteile, die der Import selbst auswertet (AREA = Text zwischen Jahr und erstem '_DSM' bzw.
+# '_hillshade'; Namensteil 'hillshade' = Hillshade) - in der AREA nicht zulaessig
+SBDSM_RESERVED_PARTS = ("DSM", "HILLSHADE", "LV95")
+# NoData-Platzhalter alter DSM-Lieferungen: wird nie als Hoehe uebernommen (= CELL_NODATA)
+GRID_NODATA_SENTINEL = -9999.0
+# Gitter-Pruefungen: Toleranz relativ zur Zellgroesse
+GRID_TOLERANCE = 1e-3
+KIND_LABELS = {"esri": "ESRI-ASCII-Grid", "xyz_grid": "XYZ-Gitter", "points": "XYZ-Punkte"}
+
+
+def _gsd_label(gsd: float) -> str:
+    """GSD im Dateinamen wie in den Lieferungen: ganze Meter '1m', sonst Zentimeter '50cm'."""
+    gsd = float(gsd)
+    if gsd >= 1 and abs(gsd - round(gsd)) < 1e-9:
+        return f"{int(round(gsd))}m"
+    return f"{round(gsd * 100, 4):g}cm"
+
+
+def _sbdsm_raster_names(jahr: str, area: str, gsd: float) -> tuple:
+    """(DSM, Hillshade): <Jahr>_<AREA>_DSM_<GSD>_LV95_LN02.tif / <Jahr>_<AREA>_hillshade_<GSD>_LV95_LN02.tif"""
+    label, suffix = _gsd_label(gsd), _height_suffix(SBDSM_HEIGHT_REF)
+    return (f"{jahr}_{area}_DSM_{label}{suffix}.tif", f"{jahr}_{area}_hillshade_{label}{suffix}.tif")
+
+
+def _sbdsm_job_name(jahr: str, area: str) -> str:
+    """Name des Staging-Job-Ordners und der Log-Datei, z.B. 2014_ALETSCH_DSM_LV95_LN02."""
+    return f"{str(jahr).strip()}_{str(area).strip()}_DSM{_height_suffix(SBDSM_HEIGHT_REF)}"
+
+
+def _sbdsm_name_problems(jahr: str, area: str) -> list:
+    """Gruende, warum Jahr/AREA keinen vom SB_DSM-Import lesbaren Namen ergeben ([] = ok)."""
+    jahr, area = str(jahr).strip(), str(area).strip()
+    problems = []
+    if not re.fullmatch(r"20\d{2}", jahr):
+        problems.append(f"Jahr '{jahr}' ungueltig - der SB_DSM-Import erwartet 20xx (z.B. 2014)")
+    if not area:
+        problems.append("AREA fehlt")
+    elif re.search(r'[<>:"/\\|?*\s]', area):
+        problems.append(f"AREA '{area}' enthaelt Leerzeichen oder unzulaessige Zeichen")
+    else:
+        reserved = [p for p in area.upper().split("_") if p in SBDSM_RESERVED_PARTS]
+        if reserved:
+            problems.append(f"AREA '{area}' enthaelt den Namensteil '{reserved[0]}' - der SB_DSM-Import "
+                            "liest die AREA nur bis zum ersten '_DSM' bzw. '_hillshade'")
+    if not problems:
+        dsm, hs = _sbdsm_raster_names(jahr, area, 1.0)
+        for name in (dsm, os.path.splitext(dsm)[0] + ".tfw", hs):
+            if not any(p.match(name) for p in SBDSM_NAME_PATTERNS):
+                problems.append(f"'{name}' passt nicht zum Namensmuster des SB_DSM-Imports")
+    return problems
+
+
+def _source_name_parts(filename: str, is_file: bool = True) -> dict:
+    """Jahr, AREA und GSD aus einem Lieferungsnamen, z.B. 2014_ALETSCH_MOOSFLUE_DSM_1m_LV95_LN02_CIR_low.asc
+    -> 2014 / ALETSCH_MOOSFLUE / 1.0 (Vorbelegung im GUI, Kontrolle der Zellgroesse). Fehlt -> '' / None.
+    is_file=False: Ordnername (keine Endung abschneiden, '..._1.5m' bliebe sonst nicht ganz)."""
+    stem = os.path.basename(os.path.normpath(filename))
+    if is_file:
+        stem = os.path.splitext(stem)[0]
+    m_jahr = re.match(r"(\d{4})_", stem)
+    m_area = re.match(r"\d{4}_(.+?)_DSM(?:_|$)", stem, re.IGNORECASE)
+    m_gsd = re.search(r"(?:^|_)(\d+(?:[.,]\d+)?)(m|cm)(?=_|$)", stem, re.IGNORECASE)
+    gsd = None
+    if m_gsd:
+        gsd = float(m_gsd.group(1).replace(",", ".")) * (0.01 if m_gsd.group(2).lower() == "cm" else 1.0)
+    return {"jahr": m_jahr.group(1) if m_jahr else "", "area": m_area.group(1) if m_area else "",
+            "gsd": gsd}
+
+
+def _read_esri_header(path: str) -> dict:
+    """Kopf eines ESRI-ASCII-Grids, ohne die Daten zu lesen; {} wenn die Datei keinen hat.
+    box = Aussenkante des Gitters (bei xllcenter/yllcenter um eine halbe Zelle verschoben)."""
+    values, n_lines = {}, 0
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        for _ in range(12):
+            line = f.readline(4096)   # Datenzeilen koennen sehr lang sein - nur den Anfang lesen
+            if not line:
+                break
+            parts = line.split()
+            if not parts:
+                continue
+            key = parts[0].lower()
+            if key not in ESRI_HEADER_KEYS:
+                break
+            if len(parts) < 2 or not _is_number(parts[1]):
+                raise ValueError(f"{os.path.basename(path)}: ESRI-Kopfzeile ohne Zahl: '{line.strip()[:60]}'")
+            values[key] = float(parts[1])
+            n_lines += 1
+    if not values:
+        return {}
+    cs_x = values.get("cellsize", values.get("dx"))
+    cs_y = values.get("cellsize", values.get("dy"))
+    missing = [k for k, ok in (("ncols", "ncols" in values), ("nrows", "nrows" in values),
+                               ("xllcorner/xllcenter", "xllcorner" in values or "xllcenter" in values),
+                               ("yllcorner/yllcenter", "yllcorner" in values or "yllcenter" in values),
+                               ("cellsize", cs_x is not None and cs_y is not None)) if not ok]
+    if missing:
+        raise ValueError(f"{os.path.basename(path)}: unvollstaendiger ESRI-Kopf, es fehlt {', '.join(missing)}")
+    xll = values["xllcorner"] if "xllcorner" in values else values["xllcenter"] - cs_x / 2
+    yll = values["yllcorner"] if "yllcorner" in values else values["yllcenter"] - cs_y / 2
+    ncols, nrows = int(values["ncols"]), int(values["nrows"])
+    return {"ncols": ncols, "nrows": nrows, "cellsize_x": cs_x, "cellsize_y": cs_y,
+            "box": (xll, yll, xll + ncols * cs_x, yll + nrows * cs_y),
+            "corner": "xllcorner" in values, "nodata": values.get("nodata_value"), "header_lines": n_lines}
+
+
+def _xyz_spacing(path: str, sniff: dict, max_lines: int = 5000) -> float:
+    """Zellgroesse, wenn die ersten Zeilen einer XYZ-Datei ein regelmaessiges Gitter bilden, sonst 0.0
+    (= unregelmaessige Punkte). Gitter: aufeinanderfolgende Zeilen laufen entlang einer Gitterzeile
+    oder -spalte, fast jeder Schritt ist genau eine Zelle, alle Koordinaten liegen auf demselben
+    Raster. Nur Vorab-Erkennung - beim Verarbeiten prueft der GDAL-XYZ-Treiber die ganze Datei."""
+    pts = []
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        for _ in range(int(sniff["skip"])):
+            f.readline()
+        for line in f:
+            parts = _split_fields(line.strip(), sniff["separator"])
+            if len(parts) < 3:
+                continue
+            try:
+                pts.append((float(parts[0]), float(parts[1])))
+            except ValueError:
+                continue
+            if len(pts) >= max_lines:
+                break
+    steps = []
+    for (xa, ya), (xb, yb) in zip(pts, pts[1:]):
+        dx, dy = abs(xb - xa), abs(yb - ya)
+        if dy < 1e-6 < dx:
+            steps.append(dx)
+        elif dx < 1e-6 < dy:
+            steps.append(dy)
+    # Zeilenwechsel und einzelne Luecken sind erlaubt, Zufallspunkte haben kaum achsparallele Schritte
+    if len(pts) < 3 or len(steps) < 0.8 * (len(pts) - 1):
+        return 0.0
+    d = sorted(steps)[len(steps) // 2]
+    tol = max(GRID_TOLERANCE * d, 0.006)   # Koordinaten im ASCII oft auf cm gerundet
+    if d < 0.01 or sum(1 for s in steps if abs(s - d) <= tol) < 0.9 * len(steps):
+        return 0.0
+    x0, y0 = pts[0]
+    for x, y in pts:
+        for v, v0 in ((x, x0), (y, y0)):
+            k = (v - v0) / d
+            if abs(k - round(k)) * d > tol:
+                return 0.0
+    return round(d, 6)
+
+
+def _ascii_kind(path: str) -> dict:
+    """Art einer ASCII-DSM-Datei aus Kopf bzw. Stichprobe: 'esri' (ESRI-ASCII-Grid), 'xyz_grid'
+    (XYZ, regelmaessiges Gitter) oder 'points' (XYZ, unregelmaessige Punkte)."""
+    header = _read_esri_header(path)
+    if header:
+        return {"kind": "esri", "header": header, "cellsize": header["cellsize_x"], "box": header["box"]}
+    sniff = _sniff_ascii(path)
+    d = _xyz_spacing(path, sniff)
+    return {"kind": "xyz_grid" if d else "points", "sniff": sniff, "cellsize": d}
+
+
+def _grid_set_check(grids: dict) -> tuple:
+    """Prueft, ob Gitter-Dateien EIN Mosaik ergeben: quadratische, gleich grosse Zellen auf
+    demselben Raster, keine flaechige Ueberlappung, Lage LV95.
+    grids: {name: (box, zelle_x, zelle_y)}. Rueckgabe: (probleme, zellgroesse, gesamt_box)."""
+    items = sorted(grids.items())
+    ref_name, (ref_box, cs, _) = items[0]
+    problems = []
+    for name, (box, cx, cy) in items:
+        if abs(cx - cy) > GRID_TOLERANCE * cx:
+            problems.append(f"{name}: Zellen nicht quadratisch ({cx:g} x {cy:g} m)")
+        elif abs(cx - cs) > GRID_TOLERANCE * cs:
+            problems.append(f"{name}: Zellgroesse {cx:g} m, {ref_name} hat {cs:g} m")
+        crs = _classify_crs(*box)
+        if crs != "LV95":
+            problems.append(f"{name}: Koordinaten nicht LV95 ({crs}: X {box[0]:.6g}-{box[2]:.6g}, "
+                            f"Y {box[1]:.6g}-{box[3]:.6g})")
+    for name, (box, _, _) in items[1:]:
+        shift = [((v - o) / cs - round((v - o) / cs)) * cs for v, o in ((box[0], ref_box[0]), (box[1], ref_box[1]))]
+        if any(abs(s) > GRID_TOLERANCE * cs for s in shift):
+            problems.append(f"{name}: Gitter um {shift[0]:+.3f} / {shift[1]:+.3f} m gegen {ref_name} "
+                            "verschoben - nicht auf demselben Raster")
+    for i, (a, (ba, _, _)) in enumerate(items):
+        for b, (bb, _, _) in items[i + 1:]:
+            w = min(ba[2], bb[2]) - max(ba[0], bb[0])
+            h = min(ba[3], bb[3]) - max(ba[1], bb[1])
+            if w > cs / 2 and h > cs / 2:
+                problems.append(f"{a}  <->  {b}: ueberlappen ({w:g} x {h:g} m)")
+    union = (min(v[0][0] for _, v in items), min(v[0][1] for _, v in items),
+             max(v[0][2] for _, v in items), max(v[0][3] for _, v in items))
+    return problems, cs, union
+
+
+def _read_lines(path: str, n: int, width: int = 120) -> list:
+    """Die ersten n nicht-leeren Zeilen, je hoechstens width Zeichen (ESRI-Zeilen sind sehr lang)."""
+    lines = []
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        while len(lines) < n:
+            line = f.readline(width)
+            if not line:
+                break
+            if not line.endswith("\n"):
+                f.readline()                     # Rest der langen Zeile ueberspringen
+            if line.strip():
+                lines.append(line.rstrip("\r\n")[:width])
+    return lines
+
+
+def _raster_info(cfg: dict) -> None:
+    """Datei-Info fuer den Raster-Tab (Aktion 'info', format 'raster') als JSON-Zeile auf stdout.
+    Liest nur Koepfe bzw. die ersten Zeilen - auch bei GB-grossen Dateien sofort da."""
+    input_dir = cfg["input_dir"]
+    if not os.path.isdir(input_dir):
+        raise FileNotFoundError(f"Input-Ordner nicht gefunden: {input_dir}")
+    files = _list_inputs(input_dir, "ascii")
+    result = {"format": "raster", "n_ascii": len(files), "n_las": len(_list_inputs(input_dir, "las")),
+              "n_files": len(files), "sample": os.path.basename(files[0]) if files else "",
+              "size_mb": round(sum(os.path.getsize(p) for p in files) / 1024 ** 2, 1)}
+    if not files:
+        print(json.dumps(result, ensure_ascii=False), flush=True)
+        return
+
+    kinds, errors, counts = {}, [], {}
+    for f in files:
+        try:
+            kinds[f] = _ascii_kind(f)
+            counts[kinds[f]["kind"]] = counts.get(kinds[f]["kind"], 0) + 1
+        except Exception as e:
+            errors.append(f"{os.path.basename(f)}: {e}")
+    mode = ""
+    if len(counts) > 1:
+        mode = "mixed"
+    elif counts:
+        mode = "points" if "points" in counts else "grid"
+    heights = {}
+    for f in files:
+        h = _source_height(f, "ascii") or "ohne"
+        heights[h] = heights.get(h, 0) + 1
+    result.update({"kinds": counts, "mode": mode, "errors": errors, "vertical_tags": heights,
+                   "name_parts": _source_name_parts(files[0]),
+                   "cellsizes": sorted({round(k["cellsize"], 6) for k in kinds.values() if k["cellsize"]})})
+
+    first = kinds.get(files[0])
+    if first is None:
+        print(json.dumps(result, ensure_ascii=False), flush=True)
+        return
+    meta = {"file": os.path.basename(files[0]), "size": f"{os.path.getsize(files[0]) / 1024 ** 2:,.1f} MB"}
+    if first["kind"] == "esri":
+        h = first["header"]
+        esri = {os.path.basename(f): (k["box"], k["header"]["cellsize_x"], k["header"]["cellsize_y"])
+                for f, k in kinds.items() if k["kind"] == "esri"}
+        problems, cs, union = _grid_set_check(esri)
+        result.update({"extent": list(union), "set_problems": problems,
+                       "grid_cells": [int(round((union[2] - union[0]) / cs)), int(round((union[3] - union[1]) / cs))],
+                       "crs_guess": _classify_crs(*union),
+                       "count_estimate": sum(k["header"]["ncols"] * k["header"]["nrows"] for k in kinds.values()
+                                             if k["kind"] == "esri"),
+                       "preview": _read_lines(files[0], h["header_lines"] + 2, 90)})
+        nd = h["nodata"]
+        meta.update({
+            "version": "ESRI-ASCII-Grid (AAIGrid)",
+            "grid": f"{h['ncols']} x {h['nrows']} Zellen a {h['cellsize_x']:g} m",
+            "origin": "{} {:.2f} / {:.2f}".format("Ecke unten links" if h["corner"] else "Zellmitte unten links",
+                                                 h["box"][0], h["box"][1]),
+            "nodata": f"{nd:g}" if nd is not None else f"- (kein NODATA_value, {GRID_NODATA_SENTINEL:g} gilt als NoData)",
+        })
+    else:
+        sniff = first["sniff"]
+        result.update({"crs_guess": sniff["crs_guess"], "first_xy": sniff["first_xy"],
+                       "count_estimate": sum(k["sniff"]["count_estimate"] for k in kinds.values() if "sniff" in k),
+                       "preview": [line[:90] for line in sniff["preview"]]})
+        meta.update(_ascii_metadata(files[0], sniff))
+        meta["version"] = f"{KIND_LABELS[first['kind']]}  /  " + meta["version"]
+        if first["kind"] == "xyz_grid":
+            meta["grid"] = f"Abstand {first['cellsize']:g} m (aus den ersten Zeilen)"
+    hints = _name_crs_hints(files[0])
+    crs_text = {"LV95": "Werte passen zu LV95 (EPSG:2056)", "LV03": "Werte passen zu LV03 - NICHT unterstuetzt",
+                "GRAD": "Werte in Grad - NICHT unterstuetzt"}.get(result["crs_guess"],
+                                                                 "Werte weder LV95 noch LV03")
+    height = next((x for x in ("LHN95", "LN02") if x in hints), "")
+    meta.update({"crs_horizontal": f"kein CRS-Tag (ASCII)  |  {crs_text}",
+                 "crs_vertical": "kein CRS-Tag (ASCII)  |  " + (f"Dateiname: {height}" if height
+                                                                 else "Dateiname ohne Hoehenangabe"),
+                 "name_hints": ", ".join(hints) or "- (keine CRS-Angabe im Dateinamen)"})
+    result["first_meta"] = meta
+    print(json.dumps(result, ensure_ascii=False), flush=True)
+
+
+def _open_grids(files: list, kinds: dict) -> tuple:
+    """Oeffnet die Gitter-Dateien mit GDAL (AAIGrid bzw. XYZ). Rueckgabe: ([(name, dataset)], grund);
+    grund != '', wenn GDAL eine XYZ-Datei nicht als Gitter liest (dann Weg 'Punkte')."""
+    from osgeo import gdal
+    gdal.UseExceptions()
+    grids = []
+    for f in files:
+        name = os.path.basename(f)
+        driver = "AAIGrid" if kinds[f]["kind"] == "esri" else "XYZ"
+        if driver == "XYZ":
+            _log(f"  {name}: GDAL-XYZ-Treiber prueft das Gitter (liest die ganze Datei) ...")
+        try:
+            ds = gdal.OpenEx(f, gdal.OF_RASTER, allowed_drivers=[driver])
+        except Exception as e:
+            if driver == "XYZ":
+                return [], f"{name}: {e}"
+            raise ValueError(f"{name}: als ESRI-ASCII-Grid nicht lesbar - {e}")
+        gt = ds.GetGeoTransform()
+        if gt[2] or gt[4] or gt[5] >= 0:
+            raise ValueError(f"{name}: Gitter gedreht oder nicht nordorientiert (Geotransform {gt})")
+        grids.append((name, ds))
+    return grids, ""
+
+
+def _grid_box(ds) -> tuple:
+    gt = ds.GetGeoTransform()
+    return (gt[0], gt[3] + gt[5] * ds.RasterYSize, gt[0] + gt[1] * ds.RasterXSize, gt[3])
+
+
+def _mosaic_grids(grids: list, bounds: tuple, cs: float, out_path: str, p0: float, pspan: float) -> dict:
+    """Kopiert die Gitter-Quellen 1:1 (blockweise, ohne Resampling) auf ein gemeinsames Float32-Raster
+    = Quellgitter ueber die Gesamtausdehnung. NoData der Quelle, NaN und -9999 -> CELL_NODATA.
+    grids: [(name, gdal.Dataset)]. Rueckgabe: {valid, nodata, sentinel, zmin, zmax}."""
+    from osgeo import gdal, osr
+    import numpy as np
+    xs = int(round((bounds[2] - bounds[0]) / cs))
+    ys = int(round((bounds[3] - bounds[1]) / cs))
+    out = gdal.GetDriverByName("GTiff").Create(
+        out_path, xs, ys, 1, gdal.GDT_Float32,
+        options=["TILED=YES", "BLOCKXSIZE=512", "BLOCKYSIZE=512", "COMPRESS=NONE", "BIGTIFF=YES"])
+    out.SetGeoTransform((bounds[0], cs, 0.0, bounds[3], 0.0, -cs))
+    srs = osr.SpatialReference()
+    srs.SetFromUserInput(f"EPSG:2056+{HEIGHT_REFS[SBDSM_HEIGHT_REF]}")
+    out.SetSpatialRef(srs)
+    band = out.GetRasterBand(1)
+    band.SetNoDataValue(CELL_NODATA)
+    if sum(ds.RasterXSize * ds.RasterYSize for _, ds in grids) < xs * ys:
+        band.Fill(CELL_NODATA)   # Flaeche zwischen den Dateien
+
+    sentinel = np.float32(GRID_NODATA_SENTINEL)
+    stats = {"valid": 0, "nodata": 0, "sentinel": 0, "zmin": None, "zmax": None}
+    total_rows, done_rows = sum(ds.RasterYSize for _, ds in grids), 0
+    try:
+        for name, ds in grids:
+            gt = ds.GetGeoTransform()
+            xoff = int(round((gt[0] - bounds[0]) / cs))
+            yoff = int(round((bounds[3] - gt[3]) / cs))
+            src = ds.GetRasterBand(1)
+            nd = src.GetNoDataValue()
+            nx, ny = ds.RasterXSize, ds.RasterYSize
+            rows_per_chunk = max(1, (64 * 1024 * 1024) // max(1, nx * 8))
+            for y0 in range(0, ny, rows_per_chunk):
+                rows = min(rows_per_chunk, ny - y0)
+                raw = src.ReadAsArray(0, y0, nx, rows)
+                # NoData im Quelltyp vergleichen, erst danach nach Float32
+                bad = np.zeros(raw.shape, dtype=bool) if nd is None else (raw == nd)
+                if raw.dtype.kind == "f":
+                    bad |= np.isnan(raw)
+                arr = raw.astype(np.float32)
+                sent = (arr == sentinel) & ~bad
+                bad |= sent
+                n_bad = int(np.count_nonzero(bad))
+                stats["sentinel"] += int(np.count_nonzero(sent))
+                stats["nodata"] += n_bad
+                stats["valid"] += arr.size - n_bad
+                if n_bad < arr.size:
+                    v = arr[~bad]
+                    lo, hi = float(v.min()), float(v.max())
+                    stats["zmin"] = lo if stats["zmin"] is None else min(stats["zmin"], lo)
+                    stats["zmax"] = hi if stats["zmax"] is None else max(stats["zmax"], hi)
+                arr[bad] = CELL_NODATA
+                band.WriteArray(arr, xoff, yoff + y0)
+                done_rows += rows
+                _progress(p0 + pspan * done_rows / total_rows)
+            _log(f"  {name}: {nx} x {ny} Zellen kopiert (Versatz {xoff} / {yoff})")
+        band.FlushCache()
+    finally:
+        band = None
+        out = None
+    return stats
+
+
+def _compare_dsm(src_path: str, dsm_path: str) -> tuple:
+    """Kontrolle des Gitter-Wegs: (gueltige Zellen im DSM, Zellen mit anderem Wert oder anderem
+    NoData-Status als im Mosaik). Mosaik: NoData CELL_NODATA, DSM: NoData -FLT_MAX."""
+    from osgeo import gdal
+    import numpy as np
+    a_ds, b_ds = gdal.Open(src_path), gdal.Open(dsm_path)
+    try:
+        if (a_ds.RasterXSize, a_ds.RasterYSize) != (b_ds.RasterXSize, b_ds.RasterYSize):
+            raise RuntimeError(f"DSM {b_ds.RasterXSize} x {b_ds.RasterYSize} statt "
+                               f"{a_ds.RasterXSize} x {a_ds.RasterYSize} Zellen")
+        a, b = a_ds.GetRasterBand(1), b_ds.GetRasterBand(1)
+        xs, ys = a_ds.RasterXSize, a_ds.RasterYSize
+        rows_per_chunk = max(1, (64 * 1024 * 1024) // max(1, xs * 4))
+        nd_a, nd_b = np.float32(CELL_NODATA), np.float32(RASTER_NODATA)
+        valid = diff = 0
+        for y0 in range(0, ys, rows_per_chunk):
+            rows = min(rows_per_chunk, ys - y0)
+            va, vb = a.ReadAsArray(0, y0, xs, rows), b.ReadAsArray(0, y0, xs, rows)
+            ma, mb = va != nd_a, vb != nd_b
+            valid += int(np.count_nonzero(mb))
+            diff += int(np.count_nonzero(ma != mb)) + int(np.count_nonzero(ma & mb & (va != vb)))
+    finally:
+        a_ds = b_ds = None
+    return valid, diff
+
+
+def _z_warning(zmin, zmax) -> None:
+    if zmin is not None and (zmin < PLAUSIBLE_Z[0] or zmax > PLAUSIBLE_Z[1]):
+        _log(f"  WARNUNG       : Z ausserhalb des fuer die Schweiz plausiblen Bereichs "
+             f"({PLAUSIBLE_Z[0]:g}-{PLAUSIBLE_Z[1]:g} m) - andere NoData-Werte oder Ausreisser in der "
+             "Quelle? Die Werte werden unveraendert uebernommen.")
+
+
+def _raster_from_grids(grids: list, bounds: tuple, cs: float, run_dir: Path, dsm_path: str,
+                       hs_path: str, workers: int) -> None:
+    """Weg 'Gitter': Werte 1:1 (GSD = Zellgroesse, keine Interpolation, keine Lochfuellung)."""
+    from osgeo import gdal
+    gdal.UseExceptions()
+    xs, ys = int(round((bounds[2] - bounds[0]) / cs)), int(round((bounds[3] - bounds[1]) / cs))
+    _log(f"\n[2/3] Mosaik 1:1 auf dem Quellgitter: {xs} x {ys} Zellen a {cs:g} m "
+         f"({xs * ys / 1e6:.1f} Mio.) ...")
+    mosaic = str(run_dir / "dsm_grid.tif")
+    stats = _mosaic_grids(grids, bounds, cs, mosaic, 0.0, 0.55)
+    _log(f"  Zellen mit Hoehe : {_fmt_count(stats['valid'])}  |  NoData: {_fmt_count(stats['nodata'])}")
+    if stats["sentinel"]:
+        _log(f"  davon {_fmt_count(stats['sentinel'])} Zelle(n) mit {GRID_NODATA_SENTINEL:g} ohne NoData-"
+             "Deklaration in der Quelle -> NoData")
+    if not stats["valid"]:
+        raise RuntimeError("Keine gueltige Hoehe in den Quellen - nur NoData.")
+    _log(f"  Z-Bereich        : {stats['zmin']:.2f} - {stats['zmax']:.2f} m")
+    _z_warning(stats["zmin"], stats["zmax"])
+
+    _log(f"\n[3/3] DSM + Hillshade ...")
+    raw_hs = str(run_dir / "hillshade_raw.tif")
+    gdal.DEMProcessing(raw_hs, mosaic, "hillshade",
+                       options=gdal.DEMProcessingOptions(computeEdges=True)).FlushCache()
+    _progress(0.7)
+    _finish_rasters(mosaic, raw_hs, dsm_path, hs_path, bounds, cs, SBDSM_HEIGHT_REF, workers)
+    _progress(0.9)
+    valid, diff = _compare_dsm(mosaic, dsm_path)
+    if diff or valid != stats["valid"]:
+        raise RuntimeError(f"Kontrolle 1:1 fehlgeschlagen: {diff} Zelle(n) weichen vom Mosaik ab, "
+                           f"{valid} statt {stats['valid']} gueltige Zellen im DSM")
+    _log(f"  Kontrolle OK: alle {_fmt_count(valid)} Hoehen 1:1 aus den Quellen, NoData unveraendert")
+    _progress(1.0)
+
+
+def _raster_from_points(files: list, kinds: dict, run_dir: Path, pdal_exe: str, workers: int,
+                        chunk_bytes: int, gsd: float, raster_dir: str, names: tuple) -> None:
+    """Weg 'Punkte': ASCII -> LAZ (ohne Z <= -9999) -> 1-km-Stuecke -> IDW mit der gewaehlten GSD,
+    kleine Loecher interpoliert - derselbe Raster-Code wie 'Create DSM-Raster' der Kachel-Tabs."""
+    labels = {f: os.path.basename(f) for f in files}
+    read_fmt = {f: (kinds[f]["sniff"]["columns"].split(), kinds[f]["sniff"]["separator"],
+                    int(kinds[f]["sniff"]["skip"])) for f in files}
+    _log(f"\n[2/3] ASCII -> LAZ (readers.text, Z <= {GRID_NODATA_SENTINEL:g} = NoData wird verworfen) ...")
+    sources, origin_of = _ascii_to_laz_all(files, read_fmt, run_dir, pdal_exe, workers, chunk_bytes,
+                                           OUT_POINT_FORMAT, 0.0, 0.3, drop_nodata=True)
+    headers = {s: _read_las_header(s) for s in sources}
+    not_lv95, file_box = [], {}
+    for s, h in headers.items():
+        crs = _classify_crs(h["minx"], h["miny"], h["maxx"], h["maxy"])
+        if crs != "LV95":
+            not_lv95.append(f"{labels[origin_of[s]]}: {crs}")
+        o, box = origin_of[s], (h["minx"], h["miny"], h["maxx"], h["maxy"])
+        old = file_box.get(o, box)
+        file_box[o] = (min(old[0], box[0]), min(old[1], box[1]), max(old[2], box[2]), max(old[3], box[3]))
+    if not_lv95:
+        raise ValueError("Quelldaten nicht in LV95 (EPSG:2056):\n  " + "\n  ".join(sorted(not_lv95)[:10])
+                         + "\n" + NOT_LV95_HINT)
+    clashes = _overlapping_pairs(file_box)
+    if clashes:
+        raise ValueError("Input-Dateien ueberlappen raeumlich - im Mosaik entstuenden doppelte Punkte:\n  "
+                         + "\n  ".join(f"{labels[a]}  <->  {labels[b]}" for a, b in clashes[:10])
+                         + "\nDateien getrennt verarbeiten.")
+    zmin = min(h["minz"] for h in headers.values())
+    zmax = max(h["maxz"] for h in headers.values())
+    _log(f"  Punkte        : {_fmt_count(sum(h['count'] for h in headers.values()))}  |  "
+         f"Z {zmin:.2f} - {zmax:.2f} m")
+    _z_warning(zmin, zmax)
+
+    _log(f"  in {RASTER_WORK_CELL_M:g}-m-Stuecke zerlegen (pdal tile) ...")
+    pieces, failed = [], []
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = {ex.submit(_split_worker, (s, str(run_dir / "p" / f"{i:05d}"), pdal_exe,
+                                          RASTER_WORK_CELL_M, OUT_POINT_FORMAT)): s
+                for i, s in enumerate(sources)}
+        for done, fut in enumerate(as_completed(futs), 1):
+            try:
+                _, ps = fut.result()
+                pieces += [p for _, p, count in ps if count]
+            except Exception as e:
+                failed.append(f"{labels[origin_of[futs[fut]]]}: {e}")
+            _progress(0.3 + 0.15 * done / len(sources))
+    if failed:
+        raise RuntimeError("Zerlegen fehlgeschlagen:\n  " + "\n  ".join(failed[:10]))
+    for s in sources:
+        _discard(s)   # Zwischen-LAZ nicht mehr noetig (Platz im Staging)
+
+    _log(f"\n[3/3] DSM + Hillshade aus {len(pieces)} Stueck(en) (IDW) ...")
+    _build_dsm_raster(sorted(pieces), raster_dir, "", "", gsd, SBDSM_HEIGHT_REF, run_dir / "r", workers,
+                      pdal_exe, 0.45, 0.55, names=names)
+
+
+# ─── Hauptablauf (Aktion 'raster') ─────────────────────────────────────────────
+#   1) Dateien analysieren: ESRI-ASCII-Grid / XYZ-Gitter / XYZ-Punkte. Alle Dateien eines
+#      Ordners = EIN Mosaik derselben Art; Lage LV95, flaechige Ueberlappung -> Abbruch.
+#   2a) Gitter: Werte 1:1 auf dem Quellgitter (GSD = Zellgroesse, keine Interpolation, keine
+#       Lochfuellung); NoData der Quelle und -9999 -> NoData
+#   2b) Punkte: ASCII -> LAZ -> 1-km-Stuecke -> IDW mit gewaehlter GSD, Loecher <= 900 m2 gefuellt
+#   3) DSM (Float32, NoData -FLT_MAX, EPSG:2056+5728) + Hillshade (Byte, NoData 255, EPSG:2056),
+#      je mit .tfw, Namen <Jahr>_<AREA>_DSM|hillshade_<GSD>_LV95_LN02.tif, Kontrolle
+# Hoehen werden nie umgerechnet, nur als LN02 getaggt (Hoehenangabe im Dateinamen -> nur Warnung).
+def _process_raster(cfg: dict) -> None:
+    t_start     = time.time()
+    input_dir   = cfg["input_dir"]
+    raster_dir  = str(cfg.get("raster_dir") or "").strip()
+    jahr        = str(cfg.get("jahr") or "").strip()
+    area        = str(cfg.get("area") or "").strip()
+    gsd_points  = float(cfg.get("gsd") or 0.0)
+    workers     = max(1, int(cfg.get("num_workers") or 4))
+    keep        = bool(cfg.get("keep_staging"))
+    chunk_bytes = int(float(cfg.get("ascii_chunk_mb") or ASCII_CHUNK_MB) * 1024 ** 2)
+    staging_dir = cfg.get("staging_dir") or os.path.join(raster_dir, "_staging")
+
+    # --- Eingaben pruefen, bevor irgendetwas geschrieben wird ---
+    problems = _sbdsm_name_problems(jahr, area)
+    if problems:
+        raise ValueError("Benennung fuer SB_DSM nicht moeglich:\n  " + "\n  ".join(problems))
+    if not raster_dir:
+        raise ValueError("Raster-Output-Ordner fehlt.")
+    if not os.path.isdir(input_dir):
+        raise FileNotFoundError(f"Input-Ordner nicht gefunden: {input_dir}")
+    files = _list_inputs(input_dir, "ascii")
+    if not files:
+        raise FileNotFoundError(f"Keine ASCII-Dateien ({'/'.join(ASCII_EXTENSIONS)}) gefunden in: {input_dir}")
+    labels = {f: os.path.basename(f) for f in files}
+
+    _log(f"Input-Ordner   : {input_dir}  ({len(files)} Datei(en))")
+    _log(f"Raster-Output  : {raster_dir}")
+    _log(f"Referenzsystem : DSM EPSG:2056+{HEIGHT_REFS[SBDSM_HEIGHT_REF]} (LV95 / {SBDSM_HEIGHT_REF}), "
+         "Hillshade EPSG:2056 - fix fuer SB_DSM, nur CRS-Tag, keine Umrechnung")
+
+    _log("\n[1/3] Input analysieren ...")
+    kinds = {}
+    for f in files:
+        k = kinds[f] = _ascii_kind(f)
+        if k["kind"] == "esri":
+            h = k["header"]
+            detail = (f"{h['ncols']} x {h['nrows']} Zellen a {h['cellsize_x']:g} m, NoData "
+                      + (f"{h['nodata']:g}" if h["nodata"] is not None else "-"))
+        elif k["kind"] == "xyz_grid":
+            detail = f"Abstand {k['cellsize']:g} m (erste Zeilen), Spalten {k['sniff']['columns']}"
+        else:
+            detail = f"Spalten {k['sniff']['columns']}, ~{_fmt_count(k['sniff']['count_estimate'])} Punkte"
+        _log(f"  {labels[f]}: {KIND_LABELS[k['kind']]}  |  {detail}")
+    found = sorted({k["kind"] for k in kinds.values()})
+    if len(found) > 1:
+        raise ValueError("Der Ordner mischt " + " und ".join(KIND_LABELS[k] for k in found) + " - alle "
+                         "Dateien eines Ordners ergeben EIN Mosaik derselben Art. Dateien getrennt verarbeiten.")
+    mode = "points" if found == ["points"] else "grid"
+
+    grids = []
+    if mode == "grid":
+        grids, reason = _open_grids(files, kinds)
+        if reason:
+            _log(f"  WARNUNG: GDAL liest die XYZ-Datei nicht als regelmaessiges Gitter ({reason}) - "
+                 "sie wird als Punktwolke behandelt (IDW, GSD aus dem GUI).")
+            mode = "points"
+    if mode == "grid":
+        problems, gsd, union = _grid_set_check(
+            {name: (_grid_box(ds), ds.GetGeoTransform()[1], -ds.GetGeoTransform()[5]) for name, ds in grids})
+        if problems:
+            raise ValueError("Die Gitter ergeben kein gemeinsames Mosaik:\n  " + "\n  ".join(problems[:10])
+                             + ("\n" + NOT_LV95_HINT if any("nicht LV95" in p for p in problems) else ""))
+        _log(f"  Weg           : Gitter - Werte 1:1, GSD = Zellgroesse {gsd:g} m, keine Interpolation")
+    else:
+        lv03 = [labels[f] for f in files if kinds[f]["sniff"]["crs_guess"] == "LV03"]
+        if lv03:
+            raise ValueError(f"Quelldaten in LV03 statt LV95: {lv03[:10]}\n{NOT_LV95_HINT}")
+        gsd = gsd_points or (_source_name_parts(files[0])["gsd"] or 0.0)
+        if not 0 < gsd <= 100:
+            raise ValueError(f"Raster-Aufloesung (GSD) {gsd:g} m ungueltig - fuer Punkte im GUI angeben.")
+        _log(f"  Weg           : Punkte - IDW mit GSD {gsd:g} m, Loecher <= {FILL_MAX_HOLE_AREA_M2:g} m2 interpoliert")
+
+    # Hoehenangabe und GSD im Dateinamen der Quelle gegen das Ergebnis - nur Warnung
+    for f in files:
+        h = _source_height(f, "ascii")
+        if h and h != SBDSM_HEIGHT_REF:
+            _log(f"  WARNUNG: {labels[f]} ist im Dateinamen als {h} bezeichnet - die Hoehen werden NICHT "
+                 f"umgerechnet, nur als {SBDSM_HEIGHT_REF} getaggt. Hoehenbezug pruefen, sonst zuerst mit "
+                 "GeoSuite/REFRAME nach LN02 transformieren!")
+        name_gsd = _source_name_parts(f)["gsd"]
+        if name_gsd and abs(name_gsd - gsd) > GRID_TOLERANCE * gsd:
+            _log(f"  WARNUNG: {labels[f]}: GSD im Dateinamen {name_gsd:g} m, Raster wird mit {gsd:g} m erstellt")
+
+    dsm_name, hs_name = _sbdsm_raster_names(jahr, area, gsd)
+    dsm_path, hs_path = os.path.join(raster_dir, dsm_name), os.path.join(raster_dir, hs_name)
+    pdal_exe = _resolve_pdal_exe(cfg) if mode == "points" else ""
+    Path(raster_dir).mkdir(parents=True, exist_ok=True)
+    staging_drive = Path(os.path.abspath(staging_dir)).anchor
+    if not os.path.isdir(staging_drive):
+        raise FileNotFoundError(f"Laufwerk des Staging-Ordners nicht verfuegbar: {staging_dir}")
+    run_dir = _unique_dir(Path(staging_dir), _sbdsm_job_name(jahr, area))
+    if mode == "points":
+        _check_path_lengths(files, run_dir, "", 0, "")
+    run_dir.mkdir(parents=True)
+    _log(f"  DSM           : {dsm_name}  (+ .tfw)")
+    _log(f"  Hillshade     : {hs_name}  (+ .tfw)")
+    _log(f"  Staging       : {run_dir}  |  Parallel: {workers}" + (f"  |  pdal.exe: {pdal_exe}" if pdal_exe else ""))
+
+    outputs = [p for base in (dsm_path, hs_path)
+               for p in (base, os.path.splitext(base)[0] + ".tfw", base + ".aux.xml")]
+    before = {p: os.path.getmtime(p) for p in outputs if os.path.isfile(p)}
+    try:
+        try:
+            if mode == "grid":
+                _raster_from_grids(grids, union, gsd, run_dir, dsm_path, hs_path, workers)
+            else:
+                _raster_from_points(files, kinds, run_dir, pdal_exe, workers, chunk_bytes, gsd, raster_dir,
+                                    (dsm_name, hs_name))
+        except Exception:
+            # Abbruch nach dem Schreiben (z.B. Kontrolle): in DIESEM Lauf geschriebene, ungepruefte Raster
+            # nicht liegen lassen, sonst nimmt sie ein spaeterer GDWH-Import mit. Unberuehrte bleiben.
+            removed = [p for p in outputs if os.path.isfile(p) and before.get(p) != os.path.getmtime(p)]
+            for p in removed:
+                _discard(p)
+            if removed:
+                _log(f"  Unvollstaendige Raster entfernt: {', '.join(os.path.basename(p) for p in removed)}")
+            raise
+        _log("\nZusammenfassung:")
+        _log(f"  DSM       : {dsm_path}  (+ .tfw)")
+        _log(f"  Hillshade : {hs_path}  (+ .tfw)")
+        _log(f"  -> GDWH-Import als SB_DSM (TileKey 1000)")
+        dt = time.time() - t_start
+        _log(f"\nLaufzeit: {int(dt // 60)}m {int(dt % 60):02d}s")
+        _log("Fertig.")
+    finally:
+        grids = None
+        if keep:
+            _log(f"\nStaging-Dateien behalten: {run_dir}")
+        else:
+            shutil.rmtree(run_dir, ignore_errors=True)
+            if not cfg.get("staging_dir"):
+                try:
+                    os.rmdir(staging_dir)  # Standard-Unterordner '_staging', nur falls leer
+                except OSError:
+                    pass
+
+
+# ─── Batch (Aktion 'raster' mit 'batch_list') ──────────────────────────────────
+# TXT-Liste mit Ordner-Pfaden, je Zeile ein Ordner = EIN Mosaik wie im Einzellauf. Output je
+# Ordner in <Ordner>\dsm, Jahr/AREA aus dem Dateinamen (sonst Ordnername), GSD bei Gittern die
+# Zellgroesse, bei Punkten aus dem Dateinamen (sonst GUI-Wert). Ordner mit Problemen werden
+# uebersprungen, ein Fehler stoppt den Batch nicht - Zusammenfassung am Schluss.
+BATCH_OUT_SUBDIR = "dsm"
+
+
+class BatchIncomplete(RuntimeError):
+    """Batch beendet, aber nicht alle Ordner verarbeitet (Details in der Zusammenfassung)."""
+
+
+def _read_batch_list(path: str) -> list:
+    """Ordner-Pfade aus einer TXT-Liste: eine Zeile je Ordner; leere Zeilen und '#'-Kommentare
+    ignoriert, Anfuehrungszeichen (Windows 'Als Pfad kopieren') entfernt, relative Pfade bezogen
+    auf den Ordner der Liste, doppelte Eintraege nur einmal. Reine Standardbibliothek (auch GUI)."""
+    raw = open(path, "rb").read()
+    try:
+        text = raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        text = raw.decode("cp1252")          # Notepad 'ANSI' mit Umlauten
+    base = os.path.dirname(os.path.abspath(path))
+    folders, seen = [], set()
+    for line in text.splitlines():
+        entry = line.strip().strip('"').strip("'").strip()
+        if not entry or entry.startswith("#"):
+            continue
+        full = os.path.normpath(entry if os.path.isabs(entry) else os.path.join(base, entry))
+        key = os.path.normcase(full)
+        if key not in seen:
+            seen.add(key)
+            folders.append(full)
+    return folders
+
+
+def _batch_plan(folder: str, gsd_fallback: float = 0.0) -> dict:
+    """Vorab-Analyse EINES Batch-Ordners (nur Koepfe bzw. erste Zeilen): Art, Jahr/AREA, GSD,
+    Zielnamen. problem != '' -> Ordner wird uebersprungen."""
+    plan = {"path": folder, "out_dir": os.path.join(folder, BATCH_OUT_SUBDIR), "problem": "", "warnings": [],
+            "n_files": 0, "mode": "", "kind": "", "jahr": "", "area": "", "name_from": "", "gsd": None,
+            "gsd_from": "", "names": [], "existing": []}
+    if not os.path.isdir(folder):
+        plan["problem"] = ("ist eine Datei - erwartet wird ein Ordner" if os.path.isfile(folder)
+                           else "Ordner nicht gefunden")
+        return plan
+    files = _list_inputs(folder, "ascii")
+    plan["n_files"] = len(files)
+    if not files:
+        plan["problem"] = f"keine ASCII-Dateien ({'/'.join(ASCII_EXTENSIONS)})"
+        return plan
+    try:
+        kinds = {f: _ascii_kind(f) for f in files}
+    except Exception as e:
+        plan["problem"] = str(e)
+        return plan
+    found = sorted({k["kind"] for k in kinds.values()})
+    if len(found) > 1:
+        plan["problem"] = "mischt " + " und ".join(KIND_LABELS[k] for k in found)
+        return plan
+    plan["kind"] = KIND_LABELS[found[0]]
+    plan["mode"] = "points" if found == ["points"] else "grid"
+
+    if plan["mode"] == "grid":
+        cellsizes = sorted({round(k["cellsize"], 6) for k in kinds.values()})
+        if len(cellsizes) > 1:
+            plan["problem"] = "verschiedene Zellgroessen: " + ", ".join(f"{c:g} m" for c in cellsizes)
+            return plan
+        esri = {os.path.basename(f): (k["box"], k["header"]["cellsize_x"], k["header"]["cellsize_y"])
+                for f, k in kinds.items() if k["kind"] == "esri"}
+        if esri:
+            problems = _grid_set_check(esri)[0]
+            if problems:
+                plan["problem"] = problems[0] + (f" (+{len(problems) - 1} weitere)" if len(problems) > 1 else "")
+                return plan
+        plan["gsd"], plan["gsd_from"] = cellsizes[0], "Zellgroesse"
+    not_lv95 = [k["sniff"]["crs_guess"] for k in kinds.values() if "sniff" in k and k["sniff"]["crs_guess"] != "LV95"]
+    if not_lv95:
+        plan["problem"] = f"Koordinaten nicht LV95 ({not_lv95[0]})"
+        return plan
+
+    parts = [_source_name_parts(f) for f in files]
+    if len({(p["jahr"], p["area"]) for p in parts}) > 1:
+        plan["problem"] = "Dateinamen nennen verschiedene Jahr/AREA - ein Ordner ergibt EIN SB_DSM"
+        return plan
+    jahr, area, plan["name_from"] = parts[0]["jahr"], parts[0]["area"], "Dateiname"
+    if not (jahr and area):
+        dir_parts = _source_name_parts(folder, is_file=False)
+        if dir_parts["jahr"] and dir_parts["area"]:
+            jahr, area, plan["name_from"] = dir_parts["jahr"], dir_parts["area"], "Ordnername"
+    plan["jahr"], plan["area"] = jahr, area
+    if not (jahr and area):
+        plan["problem"] = ("Jahr/AREA weder aus dem Dateinamen noch aus dem Ordnernamen ableitbar "
+                           "(erwartet <Jahr>_<AREA>_DSM_...)")
+        return plan
+    problems = _sbdsm_name_problems(jahr, area)
+    if problems:
+        plan["problem"] = f"Name aus {plan['name_from']}: {problems[0]}"
+        return plan
+    if plan["mode"] == "points":
+        if parts[0]["gsd"]:
+            plan["gsd"], plan["gsd_from"] = parts[0]["gsd"], "Dateiname"
+        elif gsd_fallback and gsd_fallback > 0:
+            plan["gsd"], plan["gsd_from"] = float(gsd_fallback), "GUI"
+        else:
+            plan["problem"] = "XYZ-Punkte ohne GSD im Dateinamen und keine GSD im GUI"
+            return plan
+    elif parts[0]["gsd"] and abs(parts[0]["gsd"] - plan["gsd"]) > GRID_TOLERANCE * plan["gsd"]:
+        plan["warnings"].append(f"GSD im Dateinamen {parts[0]['gsd']:g} m, Zellgroesse {plan['gsd']:g} m")
+    lhn95 = [os.path.basename(f) for f in files if _source_height(f, "ascii") == "LHN95"]
+    if lhn95:
+        plan["warnings"].append(f"{len(lhn95)} Datei(en) im Namen als LHN95 bezeichnet - wird NICHT umgerechnet")
+    plan["names"] = list(_sbdsm_raster_names(jahr, area, plan["gsd"]))
+    plan["existing"] = [n for n in plan["names"] if os.path.isfile(os.path.join(plan["out_dir"], n))]
+    return plan
+
+
+def _raster_batch_info(cfg: dict) -> None:
+    """Datei-Info fuer den Batch: Vorab-Analyse aller Ordner der Liste, JSON-Zeile auf stdout."""
+    path = cfg["batch_list"]
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"TXT-Liste nicht gefunden: {path}")
+    plans = [_batch_plan(f, float(cfg.get("gsd") or 0.0)) for f in _read_batch_list(path)]
+    kinds = {}
+    for p in plans:
+        if p["kind"]:
+            kinds[p["kind"]] = kinds.get(p["kind"], 0) + 1
+    print(json.dumps({"format": "raster", "batch": True, "list": path, "gsd": float(cfg.get("gsd") or 0.0),
+                      "folders": plans,
+                      "n_folders": len(plans), "n_ok": sum(1 for p in plans if not p["problem"]),
+                      "kinds": kinds}, ensure_ascii=False), flush=True)
+
+
+def _process_raster_batch(cfg: dict) -> None:
+    t_start = time.time()
+    path = cfg["batch_list"]
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"TXT-Liste nicht gefunden: {path}")
+    gsd_fallback = float(cfg.get("gsd") or 0.0)
+    plans = [_batch_plan(f, gsd_fallback) for f in _read_batch_list(path)]
+    if not plans:
+        raise ValueError(f"TXT-Liste enthaelt keinen Ordner-Pfad: {path}")
+    n = len(plans)
+    _log(f"Batch-Liste    : {path}  ({n} Ordner)")
+    _log(f"Output         : je Ordner <Ordner>\\{BATCH_OUT_SUBDIR}")
+    for i, p in enumerate(plans, 1):
+        state = f"UEBERSPRINGEN - {p['problem']}" if p["problem"] else \
+            f"{p['kind']}, {p['names'][0]}  (Name aus {p['name_from']}, GSD {p['gsd_from']})"
+        _log(f"  [{i}/{n}] {p['path']}: {state}")
+
+    results = []   # (ordner, status, text)
+    for i, p in enumerate(plans):
+        _log(f"\n{'=' * 78}\n[{i + 1}/{n}] {p['path']}\n{'=' * 78}")
+        if p["problem"]:
+            _log(f"UEBERSPRUNGEN: {p['problem']}")
+            results.append((p["path"], "UEBERSPRUNGEN", p["problem"]))
+            _progress((i + 1) / n)
+            continue
+        _PROGRESS_RANGE[:] = [i / n, 1.0 / n]
+        try:
+            _process_raster(dict(cfg, input_dir=p["path"], raster_dir=p["out_dir"], jahr=p["jahr"],
+                                 area=p["area"], gsd=p["gsd"]))
+            results.append((p["path"], "OK", os.path.join(BATCH_OUT_SUBDIR, p["names"][0])))
+        except Exception as e:
+            _log(f"\n[FEHLER] {e}")
+            if not isinstance(e, (ValueError, FileNotFoundError)):
+                _log(traceback.format_exc())   # unerwarteter Fehler: Details fuers Log
+            results.append((p["path"], "FEHLER", str(e).strip().splitlines()[0] if str(e).strip() else repr(e)))
+            try:
+                os.rmdir(p["out_dir"])   # nur falls leer geblieben
+            except OSError:
+                pass
+        finally:
+            _PROGRESS_RANGE[:] = [0.0, 1.0]
+            _progress((i + 1) / n)
+
+    n_ok = sum(1 for _, s, _ in results if s == "OK")
+    _log(f"\n{'=' * 78}\nBatch-Zusammenfassung: {n_ok} von {n} Ordner(n) OK")
+    for folder, status, text in results:
+        _log(f"  {status:<13} {folder}  ->  {text}")
+    dt = time.time() - t_start
+    _log(f"\nLaufzeit Batch: {int(dt // 3600)}h {int(dt % 3600 // 60):02d}m {int(dt % 60):02d}s")
+    if n_ok < n:
+        raise BatchIncomplete(f"{n - n_ok} von {n} Ordner(n) nicht verarbeitet (uebersprungen/Fehler) - "
+                              "siehe Batch-Zusammenfassung.")
+    _log("Batch fertig.")
 
 
 # ─── Hauptablauf (Aktion 'process') ────────────────────────────────────────────
@@ -1482,43 +2411,10 @@ def _process(cfg: dict) -> None:
         # 1) ASCII -> Zwischen-LAZ (grosse Dateien in Teilen parallel)
         if fmt == "ascii":
             _log("\n[1/4] ASCII -> LAZ (readers.text) ...")
-            tmp_dir = run_dir / "a"
-            tmp_dir.mkdir()
-            jobs = []   # (teil_oder_datei, input_datei, kopfzeilen)
-            for i, f in enumerate(files):
-                size_b = os.path.getsize(f)
-                n_parts = min(workers, -(-size_b // chunk_bytes)) if workers > 1 else 1
-                if n_parts > 1:
-                    parts = _split_ascii(f, run_dir / "c" / f"{i:05d}", n_parts)
-                    _log(f"  {names[f]}: {size_b / 1024 ** 2:,.0f} MB -> {len(parts)} Teile (paralleles Einlesen)")
-                    jobs += [(p, f, skip if k == 0 else 0) for k, p in enumerate(parts)]
-                else:
-                    jobs.append((f, f, skip))
-            sources, failed = [], []
-            with ThreadPoolExecutor(max_workers=workers) as ex:
-                futs = {ex.submit(_ascii_to_laz_worker,
-                                  (src, str(tmp_dir / f"s{j:05d}.laz"), tmp_dir / f"p{j:05d}.json",
-                                   pdal_exe, columns, sep_key, sk, point_format)): (src, orig)
-                        for j, (src, orig, sk) in enumerate(jobs)}
-                for done, fut in enumerate(as_completed(futs), 1):
-                    src, orig = futs[fut]
-                    label = names[orig] + (f" [{os.path.basename(src)}]" if src != orig else "")
-                    try:
-                        _, dst, count, ignored = fut.result()
-                        sources.append(dst)
-                        origin_of[dst] = orig
-                        _log(f"  [{done}/{len(jobs)}] {label}: {_fmt_count(count)} Punkte"
-                             + (f"  - WARNUNG: {ignored} Zeile(n) ignoriert (Spaltenzahl)" if ignored else ""))
-                    except Exception as e:
-                        failed.append(label)
-                        _log(f"  [{done}/{len(jobs)}] {label}: FEHLER - {e}")
-                    finally:
-                        if src != orig:
-                            _discard(src)   # Teildatei sofort freigeben (Platz im Staging)
-                    _progress(0.3 * done / len(jobs))
-            if failed:
-                raise RuntimeError(f"{len(failed)} ASCII-Datei(en)/Teil(e) nicht lesbar - Abbruch vor dem Tiling.")
-            sources.sort()
+            sources, laz_origin = _ascii_to_laz_all(files, {f: (columns, sep_key, skip) for f in files},
+                                                    run_dir, pdal_exe, workers, chunk_bytes, point_format,
+                                                    0.0, 0.3)
+            origin_of.update(laz_origin)
             p0, pspan = 0.3, 0.7
         else:
             sources, p0, pspan = list(files), 0.0, 1.0
@@ -1733,9 +2629,17 @@ def main() -> None:
             _info(cfg)
         elif action == "process":
             _process(cfg)
+        elif action == "raster":
+            if cfg.get("batch_list"):
+                _process_raster_batch(cfg)
+            else:
+                _process_raster(cfg)
         else:
             print(f"[FEHLER] Unbekannte Aktion: '{action}'", flush=True)
             sys.exit(1)
+    except BatchIncomplete as e:
+        print(f"\n[FEHLER] {e}", flush=True)   # Details stehen bereits in der Zusammenfassung
+        sys.exit(1)
     except Exception as e:
         print(f"\n[FEHLER] {e}", flush=True)
         print(traceback.format_exc(), flush=True)

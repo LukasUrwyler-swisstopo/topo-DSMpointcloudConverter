@@ -1,18 +1,20 @@
-# topo-DSMpointcloudConverter – DSM ASCII/LAZ → LAZ-Tiles
+# topo-DSMpointcloudConverter – DSM ASCII/LAZ → LAZ-Tiles / DSM-Raster
 
 Wandelt alte DSM-Punktwolken (Lage bereits **LV95**) in GDWH-taugliche LAZ-Kacheln gemäss einem
-Grid-Shape (z.B. swissGRID 1km²) um – optional ausgedünnt und mit DSM-Raster + Hillshade. Struktur
-und Styling analog zu `topo-COGTIFFconverter` und `topo-DMCdataConverter`.
+Grid-Shape (z.B. swissGRID 1km²) um – optional ausgedünnt und mit DSM-Raster + Hillshade. Ein
+dritter Tab macht aus einem ASCII-DSM direkt **DSM + Hillshade für den GDWH-Import `SB_DSM`**, ohne
+Kacheln. Struktur und Styling analog zu `topo-COGTIFFconverter` und `topo-DMCdataConverter`.
 
 <img width="935" height="991" alt="image" src="https://github.com/user-attachments/assets/bff725dc-a395-4984-b899-04a3027d4e68" />
 
 
 | Tab | Input | Output |
 |---|---|---|
-| **DSM.ascii → DSM.laz-Tiles** | ASCII (`.xyz` / `.txt` / `.asc` / `.csv`), typischerweise **gemergt pro Gebiet** | eine `.laz`/`.las` je Grid-Zelle, optional DSM + Hillshade |
+| **DSM.ascii → DSM.laz-Tiles** | ASCII (`.xyz` / `.txt` / `.asc` / `.ascii` / `.csv`), typischerweise **gemergt pro Gebiet** | eine `.laz`/`.las` je Grid-Zelle, optional DSM + Hillshade |
 | **DSM.laz → DSM.laz-Tiles** | LAZ / LAS, beliebiges Tiling oder ein merged.laz | eine `.laz`/`.las` je Grid-Zelle, optional DSM + Hillshade |
+| **DSM.ascii → DSM-Raster (SB_DSM)** | ASCII-DSM eines Gebiets: ESRI-ASCII-Grid oder XYZ (Gitter oder Punkte) – ein Ordner oder **Batch** (TXT-Liste mit Ordner-Pfaden) | **ein** DSM + **ein** Hillshade je Ordner (je `.tif` + `.tfw`), fix LV95/LN02 – siehe [eigener Abschnitt](#tab-dsmascii--dsm-raster-sb_dsm) |
 
-Beide Tabs haben dieselben Eingaben in derselben Reihenfolge – der ASCII-Tab zusätzlich das
+Die beiden Kachel-Tabs haben dieselben Eingaben in derselben Reihenfolge – der ASCII-Tab zusätzlich das
 **ASCII-Format**. Die CRS-Angabe der Quelle (LAZ: Tag, ASCII: Dateiname) darf falsch sein oder
 fehlen: getaggt wird, was im GUI gewählt ist.
 
@@ -29,6 +31,9 @@ fehlen: getaggt wird, was im GUI gewählt ist.
   fällt der Teil weg.
 - Die Endung `_LV95_<Höhe>` entspricht dem Muster des GDWH-Imports (`4_SB_DSM_PUNKTWOLKE_LAS14upgrade.py`).
 - Beispiel: `2021_DIABLONS_TIN_DSM_thin02_2612_1107_LV95_LN02.laz`
+
+Raster-Tab (SB_DSM): `<Jahr>_<AREA>_DSM_<GSD>_LV95_LN02.tif` und `<Jahr>_<AREA>_hillshade_<GSD>_LV95_LN02.tif`
+(+ `.tfw`), GSD wie in den Lieferungen `1m`, `2m`, `50cm` – z.B. `2014_ALETSCH_MOOSFLUE_DSM_1m_LV95_LN02.tif`.
 
 **Ein Kachelsatz je Lauf:** alle Dateien des Input-Ordners werden je Zelle zusammengeführt (z.B. die
 Kacheln eines alten Tilings). Überlappen sich zwei Dateien flächig, bricht der Lauf ab (doppelte
@@ -48,8 +53,9 @@ daneben. Der Pfad kann über **Aendern…** gesetzt werden und wird in
 
 ## Bedienung
 
-Das Formular folgt dem Arbeitsablauf; Log und Fortschritt sind für beide Tabs gemeinsam, während
-eines Laufs sind beide Start-Buttons gesperrt.
+Das Formular folgt dem Arbeitsablauf; Log und Fortschritt sind für alle Tabs gemeinsam, während
+eines Laufs sind alle Start-Buttons gesperrt. Die Tabelle beschreibt die Kachel-Tabs, der Raster-Tab
+hat [einen eigenen Abschnitt](#tab-dsmascii--dsm-raster-sb_dsm).
 
 | | Feld | Bedeutung |
 |---|---|---|
@@ -161,8 +167,9 @@ als ASCII-Spalte vorhanden sind. Unbekannte ASCII-Spalten (`Col4` …) werden ni
 - **ASCII-Spaltenzahl**: PDAL überspringt unpassende Zeilen nur mit Warnung (Exit-Code 0) – passt die
   Spaltenzahl gar nicht, entstünde still eine leere Datei. Das Tool bricht dann ab und meldet
   ignorierte Einzelzeilen im Log.
-- **ESRI-ASCII-Grid** (`.asc` mit `ncols`/`nrows`-Kopf, also Raster statt Punktliste) wird erkannt
-  und mit Hinweis abgelehnt (`gdal_translate -of XYZ`).
+- **ESRI-ASCII-Grid** (`.asc` mit `ncols`/`nrows`-Kopf, also Raster statt Punktliste) wird im
+  ASCII-Kachel-Tab erkannt und mit Hinweis abgelehnt – für DSM-Raster den Raster-Tab verwenden, für
+  LAZ-Kacheln zuerst `gdal_translate -of XYZ`.
 - **Z-Plausibilität**: liegt der Z-Bereich ausserhalb 150–4900 m, erscheint eine Warnung im Log
   (NoData-Werte wie -9999 oder Ausreisser) – die Punkte werden unverändert übernommen.
 - **Grid-Prüfung**: Feld `NAME`, CRS EPSG:2056, alle beteiligten Zellen achsparallele Quadrate auf
@@ -171,6 +178,68 @@ als ASCII-Spalte vorhanden sind. Unbekannte ASCII-Spalten (`Col4` …) werden ni
   `file not found`. Input-, Staging- und Output-Pfade werden deshalb **vor** dem Lauf geprüft.
 - **Einmal gerundet**: Zwischendateien liegen mit scale 0.01 / Offset 0 auf demselben
   Zentimeter-Gitter wie die Endkacheln – die Requantisierung im letzten Schritt ist eine Identität.
+
+---
+
+## Tab DSM.ascii → DSM-Raster (SB_DSM)
+
+Ein Gebiet als ASCII-DSM → **ein DSM + ein Hillshade**, die der GDWH-Import
+(`topo-GDWHimport`, GDS `SB_DSM`, TileKey 1000) **ohne Nacharbeit** annimmt. Es entstehen keine
+LAZ-Kacheln. Alle ASCII-Dateien des Input-Ordners ergeben **ein** Mosaik.
+
+| Art (wird erkannt) | Erkennung | Weg |
+|---|---|---|
+| **ESRI-ASCII-Grid** (`ncols`/`nrows`/`xllcorner`/`cellsize`/`NODATA_value`) | Kopfzeilen | **Gitter** |
+| **XYZ-Gitter** (eine Zeile je Zelle, regelmässiger Abstand) | erste 5000 Zeilen: Schritte entlang einer Gitterzeile/-spalte, alle Koordinaten auf einem Raster; beim Lauf entscheidet der GDAL-XYZ-Treiber über die ganze Datei | **Gitter** (liest GDAL sie nicht als Gitter → Warnung, Weg Punkte) |
+| **XYZ-Punkte** (unregelmässig) | sonst | **Punkte** |
+
+- **Gitter:** Die Werte werden **1:1** übernommen. Das ist eine blockweise Kopie auf das Quellgitter:
+  kein Resampling, keine Interpolation, keine Lochfüllung. GSD = Zellgrösse, im GUI gesperrt.
+  Das Quellgitter bleibt unverändert, es wird nicht auf ganze Meter geschoben. Nach dem Schreiben wird
+  jede Zelle des DSM mit dem Mosaik verglichen. Erwartet: 0 Abweichungen, gleiche Zahl gültiger Zellen.
+- **Punkte:** Derselbe Raster-Code wie *Create DSM-Raster*: `readers.text` → LAZ, dann `pdal tile` in
+  1-km-Stücke, dann IDW mit der gewählten GSD. Löcher bis 900 m² werden interpoliert. Die GSD wird
+  aus dem Dateinamen vorbelegt (`_1m_`, `_50cm_`).
+- **NoData:** `NODATA_value` der Quelle, NaN und **-9999** (auch undeklariert) werden nie als
+  Höhe übernommen. Im DSM ist NoData -3.4028235e+38, im Hillshade 255, genau an denselben Zellen.
+- **Referenzsystem fix:** DSM `EPSG:2056+5728`, Hillshade `EPSG:2056`. SB_DSM kennt nur LV95_LN02,
+  der Import bricht bei LHN95 ab. Nur Tag, keine Umrechnung. Steht `LHN95` im Dateinamen, gibt es
+  eine Warnung: zuerst mit GeoSuite/REFRAME nach LN02 transformieren.
+- **Mosaik-Prüfung (Abbruch):** verschiedene Arten im Ordner, ungleiche oder nicht quadratische
+  Zellen, Gitter gegeneinander verschoben, flächige Überlappung (> ½ Zelle), Lage nicht LV95.
+- **Benennung für den Import:** Jahr `20xx`. Die AREA darf keinen Namensteil `DSM` / `hillshade` /
+  `LV95` enthalten, denn der Import liest die AREA nur bis zum ersten `_DSM` bzw. `_hillshade`.
+  Jahr und AREA werden aus dem Dateinamen vorbelegt (`<Jahr>_<AREA>_DSM_…`). Die Namensmuster sind
+  aus `GUI_GDWHimport.NAME_FORMAT_SPECS['SB_DSM']` übernommen. Ändern sie sich dort, schlägt
+  `test_sbdsm_naming` fehl.
+- Geprüft gegen den Import selbst: `_tiff_crs._check_one(…, "SB_DSM")` liefert für DSM und
+  Hillshade `ok` (kein Umtaggen), das DSM ist Float32, die Maske ist nur der NoData-Tag.
+- **Performance (Gitter):** 6000 × 6000 Zellen (290 MB ASCII) in 10 s inkl. 1:1-Kontrolle.
+  Staging braucht vorübergehend etwa die DSM-Grösse unkomprimiert (4 Byte je Zelle).
+- **Abbruch nach dem Schreiben** (z.B. Kontrolle fehlgeschlagen): die in diesem Lauf geschriebenen
+  Raster werden entfernt, damit kein ungeprüftes DSM in einen Import gerät.
+
+### Batch: TXT-Liste mit Ordner-Pfaden
+
+Input-Modus **Batch** statt *Ein Ordner*: eine TXT-Datei, je Zeile ein Ordner-Pfad. Jeder Ordner wird
+genau wie ein Einzellauf verarbeitet (alle ASCII-Dateien des Ordners = ein Mosaik).
+
+```
+# Lieferung 2014 – Kommentare und leere Zeilen werden ignoriert
+D:\DSM\2014\ALETSCH_MOOSFLUE
+"D:\DSM\2016\SILVRETTA"            ← Anführungszeichen (Windows „Als Pfad kopieren“) erlaubt
+2019_GLETSCH_DSM_50cm              ← relativ = zum Ordner der TXT-Liste
+```
+
+| | Batch |
+|---|---|
+| Output | je Ordner **`<Ordner>\dsm`** – das Feld Output-Ordner ist ausgegraut |
+| Jahr / AREA | je Ordner aus dem **Dateinamen** (`<Jahr>_<AREA>_DSM_…`), sonst aus dem **Ordnernamen** – Felder ausgegraut. Nennen die Dateien eines Ordners verschiedene Jahr/AREA, wird er übersprungen |
+| GSD | Gitter: Zellgrösse je Ordner; XYZ-Punkte: aus dem Dateinamen (`_1m_`), nur ohne Angabe gilt der GUI-Wert |
+| Vorab-Prüfung | *Datei-Info* prüft alle Ordner (nur Köpfe/erste Zeilen): je Ordner Art, GSD, Zielname oder das Problem (`!!`). Beim Start Rückfrage, wenn Ordner übersprungen werden oder Raster schon existieren |
+| Fehler | ein Ordner mit Problem wird übersprungen, ein Fehler im Lauf stoppt den Batch **nicht**; am Schluss eine Zusammenfassung OK / ÜBERSPRUNGEN / FEHLER je Ordner. Nicht alle OK → Lauf gilt als fehlgeschlagen (Exit-Code 1) |
+| Log | ein Log für den ganzen Batch: `logs/BATCH_<Listenname>_DSM_LV95_LN02_<Zeitstempel>.log` |
+| Staging | leer = `<Ordner>\dsm\_staging`, wird je Ordner aufgeräumt |
 
 ---
 
@@ -216,8 +285,8 @@ als ASCII-Spalte vorhanden sind. Unbekannte ASCII-Spalten (`Col4` …) werden ni
 | Datei | Beschreibung |
 |-------|-------------|
 | `GUI_DSMpointcloudConverter.py` | Tkinter-GUI – startet mit Standard-Python (ab 3.6) |
-| `process_scripts/_osgeo_runner.py` | Worker (Aktionen `info` / `process`) – via OSGeo4W/QGIS-Python als Subprocess, steuert `pdal.exe`; enthält auch die Benennungsregel (vom GUI für die Vorschau genutzt) |
-| `process_scripts/01_convertDATA_dsm_to_laz_tiles.py` | Standalone-Script ohne GUI (gleiche Verarbeitung, Konfiguration im Script-Kopf) |
+| `process_scripts/_osgeo_runner.py` | Worker (Aktionen `info` / `process` / `raster`) – via OSGeo4W/QGIS-Python als Subprocess, steuert `pdal.exe` bzw. GDAL; enthält auch die Benennungsregeln (vom GUI für die Vorschau genutzt) |
+| `process_scripts/01_convertDATA_dsm_to_laz_tiles.py` | Standalone-Script ohne GUI (gleiche Verarbeitung, `ACTION` und Konfiguration im Script-Kopf) |
 | `process_scripts/_dsm2laz_config.json` | GUI-Konfiguration (OSGeo4W-Python-Pfad), wird automatisch angelegt |
 | `swissGRID_1km2_shp/` | Standard-Grid (swissGRID 1km², EPSG:2056, Feld `NAME`) |
 | `test/test_functions.py` | Sanity-Checks ohne OSGeo4W/PDAL |
@@ -235,7 +304,7 @@ als ASCII-Spalte vorhanden sind. Unbekannte ASCII-Spalten (`Col4` …) werden ni
 GUI_DSMpointcloudConverter.py       (Standard-Python, tkinter)
         │  JSON-Config (tempfile)
         ▼
-process_scripts/_osgeo_runner.py    (OSGeo4W/QGIS-Python: OGR für das Grid)
+process_scripts/_osgeo_runner.py    (OSGeo4W/QGIS-Python: OGR für das Grid, GDAL für die Raster)
         │  PDAL-Pipelines / pdal tile (Subprocess, parallel)
         ▼
     pdal.exe            stdout → live ins GUI-Log + logs/*.log
@@ -247,11 +316,14 @@ process_scripts/_osgeo_runner.py    (OSGeo4W/QGIS-Python: OGR für das Grid)
 C:\OSGeo4W\bin\python3.exe process_scripts\01_convertDATA_dsm_to_laz_tiles.py
 ```
 
-Konfiguration im Script-Kopf (`CONFIG`) anpassen.
+Im Script-Kopf `ACTION` wählen (`"process"` = Kacheln, `"raster"` = DSM-Raster für SB_DSM) und die
+zugehörige Konfiguration (`CONFIG` bzw. `RASTER_CONFIG`) anpassen. Für den Batch in `RASTER_CONFIG`
+`batch_list` auf die TXT-Liste setzen.
 
 ## Log-Ausgabe
 
-Jeder Lauf schreibt eine Logdatei nach `logs/<Input-Ordner>_to_laz_<Zeitstempel>.log`.
+Jeder Lauf schreibt eine Logdatei nach `logs/<Job-Name>_<Zeitstempel>.log`, z.B.
+`2021_PERROC_TIN_DSM_thin04_LV95_LN02_…` bzw. `2014_ALETSCH_MOOSFLUE_DSM_LV95_LN02_…` (Raster-Tab).
 
 ## Tests
 

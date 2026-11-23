@@ -1,12 +1,15 @@
 """
-GUI_DSMpointcloudConverter.py  –  DSM ASCII/LAZ → LAZ-Tiles GUI
-Tkinter-Oberflaeche fuer die Umwandlung alter DSM-Punktwolken, je Input-Format ein Tab:
+GUI_DSMpointcloudConverter.py  –  DSM ASCII/LAZ → LAZ-Tiles / DSM-Raster GUI
+Tkinter-Oberflaeche fuer die Umwandlung alter DSM-Daten, je Input-Format bzw. Ziel ein Tab:
   - DSM.ascii → DSM.laz-Tiles:  ASCII (xyz)                        → LAZ/LAS-Kacheln
   - DSM.laz   → DSM.laz-Tiles:  LAZ/LAS (beliebiges Tiling/merged) → LAZ/LAS-Kacheln
-Beide Tabs: Tiling gemaess Grid-Shape, CRS-Tag LV95 + LN02/LHN95 nach Auswahl (nie umgerechnet),
+  - DSM.ascii → DSM-Raster:     ASCII-DSM eines Gebiets (ESRI-Grid / XYZ) → DSM + Hillshade (SB_DSM)
+Kachel-Tabs: Tiling gemaess Grid-Shape, CRS-Tag LV95 + LN02/LHN95 nach Auswahl (nie umgerechnet),
 optional Thinning und DSM-Raster + Hillshade.
 Dateiname je Kachel: <Jahr>_<AREA>_TIN_DSM[_thinNN]_<NAME>_LV95_<LN02|LHN95>.<laz|las>
 (NAME aus der Attributtabelle des Grids).
+Raster-Tab: <Jahr>_<AREA>_DSM|hillshade_<GSD>_LV95_LN02.tif (+ .tfw), fix LV95/LN02 fuer den
+GDWH-Import SB_DSM, Gitter 1:1 bzw. Punkte per IDW (Art wird erkannt).
 Styling analog zu topo-COGTIFFconverter / topo-DMCdataConverter.
 
 Das GUI laeuft mit Standard-Python (kein osgeo erforderlich, kompatibel ab 3.6).
@@ -42,14 +45,17 @@ DEFAULT_GRID_SHAPE  = os.path.join(SCRIPT_DIR, "swissGRID_1km2_shp", "chGRID_1km
 DEFAULT_STAGING_DIR = r"Y:\01_DSMdata_to_DSMdata"   # Vorbelegung beider Tabs, im GUI aenderbar
 
 # ─── Auswahl-Listen ───────────────────────────────────────────────────────────
-ASCII_EXTENSIONS = (".xyz", ".txt", ".asc", ".csv")
+ASCII_EXTENSIONS = (".xyz", ".txt", ".asc", ".ascii", ".csv")
 LAS_EXTENSIONS   = (".laz", ".las")
-# Ein Tab je Input-Format (Schluessel = 'format' im Runner)
+# Ein Tab je Input-Format bzw. Ziel (Schluessel = 'format' im Runner)
 TAB_LABELS = {
-    "ascii": "DSM.ascii → DSM.laz-Tiles",
-    "las":   "DSM.laz → DSM.laz-Tiles",
+    "ascii":  "DSM.ascii → DSM.laz-Tiles",
+    "las":    "DSM.laz → DSM.laz-Tiles",
+    "raster": "DSM.ascii → DSM-Raster (SB_DSM)",
 }
-FORMAT_NAMES = {"ascii": "ASCII", "las": "LAZ/LAS"}
+FORMAT_NAMES = {"ascii": "ASCII", "las": "LAZ/LAS", "raster": "ASCII"}
+# Raster-Tab: Referenzsystem fix (GDWH-Import SB_DSM kennt nur LV95_LN02)
+SBDSM_CRS_LABEL = "EPSG:2056 + 5728   (CH1903+ / LV95 + LN02)  –  fix fuer SB_DSM"
 # Schluessel 1:1 wie _osgeo_runner.SEPARATORS
 SEPARATOR_LABELS = {
     "space":     "Leerzeichen",
@@ -174,6 +180,16 @@ def _naming_preview(jahr: str, area: str, thin_m: float, height_ref: str, out_fo
     return "\n".join(lines)
 
 
+def _raster_naming_preview(jahr: str, area: str, gsd=None) -> str:
+    """Benennungs-Vorschau des Raster-Tabs (Regel im Runner), ohne GSD mit Platzhalter."""
+    runner = _runner_module()
+    jahr, area = jahr.strip() or "<Jahr>", area.strip() or "<AREA>"
+    if gsd:
+        return "\n".join(runner._sbdsm_raster_names(jahr, area, gsd))
+    token = "_{}_LV95".format(runner._gsd_label(1.0))
+    return "\n".join(n.replace(token, "_<GSD>_LV95") for n in runner._sbdsm_raster_names(jahr, area, 1.0))
+
+
 def _list_input_files(input_dir: str, fmt: str) -> List[str]:
     exts = ASCII_EXTENSIONS if fmt == "ascii" else LAS_EXTENSIONS
     try:
@@ -234,6 +250,10 @@ DARK = {
 class TilesTab:
     """Formular + Start fuer genau ein Input-Format ('ascii' oder 'las').
     Log, Fortschritt, OSGeo4W-Python und Theme teilen sich alle Tabs ueber die App."""
+
+    OUT_SUFFIX  = "_LAZ_tiles"   # Vorbelegung Output-Ordner: <Input-Ordner><OUT_SUFFIX>
+    _INFO_ATTRS = ("_info_files", "_info_version", "_info_count", "_info_extent",
+                   "_info_crs", "_info_cells", "_info_preview", "_info_meta")
 
     def __init__(self, app, parent, fmt: str):
         self.app = app
@@ -318,11 +338,13 @@ class TilesTab:
         self._in_var = tk.StringVar()
         ttk.Entry(sec, textvariable=self._in_var).grid(row=0, column=1, sticky="ew", padx=(8, 4), pady=3)
         ttk.Button(sec, text="Ordner…", command=self._browse_input).grid(row=0, column=2, pady=3)
+        self._hint(sec, self._input_hint(), 1)
+
+    def _input_hint(self) -> str:
         exts = ASCII_EXTENSIONS if self.fmt == "ascii" else LAS_EXTENSIONS
-        hint = "Alle {} im Ordner (nicht rekursiv) = EIN Kachelsatz  |  ".format("/".join(exts))
-        hint += ("typischerweise gemergt pro Gebiet" if self.fmt == "ascii"
-                 else "beliebiges Tiling oder ein merged.laz")
-        self._hint(sec, hint, 1)
+        return "Alle {} im Ordner (nicht rekursiv) = EIN Kachelsatz  |  {}".format(
+            "/".join(exts), "typischerweise gemergt pro Gebiet" if self.fmt == "ascii"
+            else "beliebiges Tiling oder ein merged.laz")
 
     def _build_dateiinfo(self, parent):
         app = self.app
@@ -496,9 +518,7 @@ class TilesTab:
         self._staging_var = tk.StringVar(value=DEFAULT_STAGING_DIR)
         ttk.Entry(sec, textvariable=self._staging_var).grid(row=0, column=1, sticky="ew", padx=(8, 4), pady=3)
         ttk.Button(sec, text="Ordner…", command=self._browse_staging).grid(row=0, column=2, pady=3)
-        inhalt = "ASCII→LAZ, Kachelstuecke, Raster-Zellen" if self.fmt == "ascii" else "Kachelstuecke, Raster-Zellen"
-        self._hint(sec, "Job-Unterordner <Jahr>_<AREA>_TIN_DSM[_thinNN]_LV95_<Hoehe>  |  Leer = <Output-Ordner>"
-                        "\\_staging  |  Zwischendateien ({}), Platzbedarf etwa Datenmenge als LAZ".format(inhalt), 1)
+        self._hint(sec, self._staging_hint(), 1)
 
         self._bold(sec, "CPU-Kerne:", 2, pady=(8, 3))
         cpu_max = max(1, os.cpu_count() or 4)
@@ -509,6 +529,11 @@ class TilesTab:
         self._keep_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(sec, text="Staging-Dateien nach Abschluss behalten (nicht loeschen)",
                         variable=self._keep_var).grid(row=3, column=0, columnspan=3, sticky="w", pady=(8, 0))
+
+    def _staging_hint(self) -> str:
+        inhalt = "ASCII→LAZ, Kachelstuecke, Raster-Zellen" if self.fmt == "ascii" else "Kachelstuecke, Raster-Zellen"
+        return ("Job-Unterordner <Jahr>_<AREA>_TIN_DSM[_thinNN]_LV95_<Hoehe>  |  Leer = <Output-Ordner>"
+                "\\_staging  |  Zwischendateien ({}), Platzbedarf etwa Datenmenge als LAZ".format(inhalt))
 
     # ── Benennung ─────────────────────────────────────────────────────────────
     def _update_name_preview(self):
@@ -537,7 +562,7 @@ class TilesTab:
         self._in_var.set(path)
         if not self._out_var.get().strip():
             p = Path(path)
-            self._out_var.set(str(p.parent / (p.name + "_LAZ_tiles")))
+            self._out_var.set(str(p.parent / (p.name + self.OUT_SUFFIX)))
         self._update_name_preview()
         self.app._clear_log()
         self._refresh_info()
@@ -566,25 +591,29 @@ class TilesTab:
 
     # ── Datei-Info via Runner ──────────────────────────────────────────────────
     def _reset_info(self):
-        for attr in ("_info_files", "_info_version", "_info_count", "_info_extent",
-                     "_info_crs", "_info_cells", "_info_preview", "_info_meta"):
+        for attr in self._INFO_ATTRS:
             if getattr(self, attr, None) is not None:
                 getattr(self, attr).config(text="–")
         self._info_warn.grid_remove()
         self._last_info = None
 
-    def _refresh_info(self):
+    def _info_cfg(self):
+        """Config fuer die Datei-Info, None solange nichts zu lesen ist."""
         src = self._in_var.get().strip()
-        self._reset_info()
         if not src or not os.path.isdir(src):
+            return None
+        return {"action": "info", "input_dir": src, "format": self.fmt,
+                "pdal_exe": self.app._pdal_exe, "grid_size": 1000}
+
+    def _refresh_info(self):
+        cfg = self._info_cfg()
+        self._reset_info()
+        if cfg is None:
             return
         osgeo_python = self.app._osgeo_python
         if not osgeo_python or not os.path.isfile(osgeo_python):
             self._info_files.config(text="OSGeo4W Python nicht gefunden – bitte Pfad setzen")
             return
-
-        cfg = {"action": "info", "input_dir": src, "format": self.fmt,
-               "pdal_exe": self.app._pdal_exe, "grid_size": 1000}
         self._info_files.config(text="wird gelesen…")
 
         def ui_error(msg):
@@ -836,12 +865,558 @@ class TilesTab:
         self.app._start_run(cfg, log_stem, TAB_LABELS[self.fmt])
 
 
+# ─── Tab 'DSM.ascii → DSM-Raster' (SB_DSM, ohne Kacheln) ──────────────────────
+class RasterTab(TilesTab):
+    """ASCII-DSM eines Gebiets direkt zu DSM + Hillshade fuer den GDWH-Import SB_DSM.
+    Ob Gitter (Werte 1:1) oder Punkte (IDW) erkennt der Runner (Datei-Info und Lauf).
+    Erbt Formular-Helfer, Datei-Info-Aufruf und Staging-Abschnitt von TilesTab."""
+
+    OUT_SUFFIX  = "_SB_DSM"
+    BATCH_OUT   = "dsm"    # Batch: Output je Ordner in <Ordner>\dsm (wie _osgeo_runner.BATCH_OUT_SUBDIR)
+    _INFO_ATTRS = ("_info_files", "_info_kind", "_info_grid", "_info_extent", "_info_crs",
+                   "_info_preview", "_info_meta", "_info_batch")
+    _META_ROWS = [("file", "Datei"), ("size", "Groesse"), ("version", "Format"), ("grid", "Gitter"),
+                  ("origin", "Ursprung"), ("nodata", "NoData"), ("count", "Punkte"),
+                  ("crs_horizontal", "Lage-CRS"), ("crs_vertical", "Hoehen-CRS"), ("name_hints", "Dateiname"),
+                  ("first_line", "1. Zeile"), ("zrange", "Z-Bereich")]
+
+    def __init__(self, app, parent, fmt: str):
+        self._mode = ""          # 'grid' | 'points' | 'mixed' | '' (noch keine Datei-Info)
+        self._grid_gsd = None    # Zellgroesse, wenn Weg 'Gitter'
+        super().__init__(app, parent, fmt)
+
+    def _build(self, parent):
+        sf = self._build_scrollable(parent)
+        self.app._build_group_header(sf, "1   Input")
+        self._build_input(sf)
+        self._build_dateiinfo(sf)
+        self.app._build_group_header(sf, "2   Projekt & Referenzsystem")
+        self._build_projekt(sf)
+        self.app._build_group_header(sf, "3   Output")
+        self._build_output(sf)
+        self.app._build_group_header(sf, "4   Staging & Parallelisierung")
+        self._build_staging(sf)
+
+        btn_row = ttk.Frame(parent)
+        btn_row.pack(fill="x", pady=(6, 0))
+        self._start_btn = ttk.Button(btn_row, text="▶   DSM-RASTER ERSTELLEN", command=self._start)
+        self._start_btn.pack(side="right", ipadx=22, ipady=7)
+
+        for var in (self._jahr_var, self._area_var, self._gsd_var):
+            var.trace_add("write", lambda *_: self._update_name_preview())
+        self._set_mode("")
+        self._on_input_mode(refresh=False)
+
+    def _input_hint(self) -> str:
+        return ("Alle {} im Ordner (nicht rekursiv) = EIN DSM (Mosaik)  |  ESRI-ASCII-Grid oder XYZ, "
+                "Gitter oder Punkte – wird erkannt".format("/".join(ASCII_EXTENSIONS)))
+
+    def _staging_hint(self) -> str:
+        return ("Job-Unterordner <Jahr>_<AREA>_DSM_LV95_LN02  |  Leer = <Output-Ordner>\\_staging (Batch: "
+                "<Ordner>\\dsm\\_staging)  |  Zwischendateien (Mosaik bzw. ASCII→LAZ und Raster-Zellen), "
+                "Platzbedarf etwa 2× DSM")
+
+    # ── 1 Input: Ein Ordner oder Batch (TXT-Liste mit Ordner-Pfaden) ─────────
+    def _build_input(self, parent):
+        sec = self._section(parent, "Input-Daten")
+        self._input_mode_var = tk.StringVar(value="single")
+        modes = ttk.Frame(sec)
+        modes.grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 4))
+        for value, text in (("single", "Ein Ordner"), ("batch", "Batch: TXT-Liste mit Ordner-Pfaden")):
+            ttk.Radiobutton(modes, text=text, value=value, variable=self._input_mode_var,
+                            command=self._on_input_mode).pack(side="left", padx=(0, 18))
+
+        self._in_var = tk.StringVar()
+        self._single_widgets = [
+            ttk.Label(sec, text="Input-Ordner:", font=("Segoe UI", 9, "bold")),
+            ttk.Entry(sec, textvariable=self._in_var),
+            ttk.Button(sec, text="Ordner…", command=self._browse_input)]
+        self._list_var = tk.StringVar()
+        self._batch_widgets = [
+            ttk.Label(sec, text="TXT-Liste:", font=("Segoe UI", 9, "bold")),
+            ttk.Entry(sec, textvariable=self._list_var),
+            ttk.Button(sec, text="Datei…", command=self._browse_list)]
+        for widgets in (self._single_widgets, self._batch_widgets):
+            widgets[0].grid(row=1, column=0, sticky="w", pady=3)
+            widgets[1].grid(row=1, column=1, sticky="ew", padx=(8, 4), pady=3)
+            widgets[2].grid(row=1, column=2, pady=3)
+        self._input_hint_lbl = self._hint(sec, self._input_hint(), 2)
+
+    def _is_batch(self) -> bool:
+        return self._input_mode_var.get() == "batch"
+
+    def _on_input_mode(self, refresh: bool = True):
+        """Umschalten Ein Ordner / Batch: im Batch kommen Output-Ordner (<Ordner>\\dsm) und
+        Jahr/AREA (Dateiname) je Ordner - die Felder werden ausgegraut."""
+        batch = self._is_batch()
+        for w in self._single_widgets:
+            w.grid_remove() if batch else w.grid()
+        for w in self._batch_widgets:
+            w.grid() if batch else w.grid_remove()
+        self._input_hint_lbl.config(text=(
+            "TXT-Datei: je Zeile ein Ordner-Pfad (leere Zeilen und #-Kommentare ignoriert, \"…\" erlaubt, "
+            "relativ = zum Ordner der Liste)  |  jeder Ordner = EIN DSM wie beim Einzellauf"
+            if batch else self._input_hint()))
+        state = "disabled" if batch else "normal"
+        self._out_entry.config(textvariable=self._batch_out_var if batch else self._out_var, state=state)
+        self._out_btn.config(state=state)
+        self._out_hint.config(text=(
+            "Batch: je Ordner der Liste in <Ordner>\\{} – wird aus dem Input-Ordner abgeleitet".format(self.BATCH_OUT)
+            if batch else "DSM + Hillshade (je .tif + .tfw) direkt fuer den GDWH-Import als SB_DSM (TileKey 1000)"))
+        self._jahr_entry.config(textvariable=self._batch_name_var if batch else self._jahr_var, state=state)
+        self._area_entry.config(textvariable=self._batch_name_var if batch else self._area_var, state=state)
+        self._projekt_hint.config(text=(
+            "Batch: Jahr und AREA je Ordner aus dem Dateinamen (<Jahr>_<AREA>_DSM_…), sonst aus dem Ordnernamen  |  "
+            "SB_DSM-Import: Jahr 20xx, AREA ohne Namensteil DSM / hillshade / LV95" if batch else
+            "Leere Felder werden aus dem Dateinamen vorbelegt (<Jahr>_<AREA>_DSM_…)  |  "
+            "SB_DSM-Import: Jahr 20xx, AREA ohne Namensteil DSM / hillshade / LV95"))
+        for attr in ("_info_grid", "_info_extent", "_info_crs", "_info_meta", "_info_preview"):
+            for w in self._info_rows[attr]:
+                w.grid_remove() if batch else w.grid()
+        for w in self._info_rows["_info_batch"]:
+            w.grid() if batch else w.grid_remove()
+        self._info_sec.config(text="Datei-Info  (aus der TXT-Liste: alle Ordner vorab geprueft)" if batch
+                              else "Datei-Info  (aus dem Input-Ordner gelesen)")
+        if refresh:
+            self._refresh_info()
+        else:
+            self._update_name_preview()
+
+    def _browse_list(self):
+        path = filedialog.askopenfilename(title="TXT-Liste mit Ordner-Pfaden auswaehlen",
+                                          filetypes=[("Textdatei", "*.txt"), ("Alle Dateien", "*.*")])
+        if path:
+            self._list_var.set(path.replace("/", "\\"))
+            self.app._clear_log()
+            self._refresh_info()
+
+    # ── 1 Input: Datei-Info ───────────────────────────────────────────────────
+    def _build_dateiinfo(self, parent):
+        app = self.app
+        self._info_sec = sec = self._section(parent, "Datei-Info  (aus dem Input-Ordner gelesen)")
+        self._info_rows = {}
+        fields = [("Dateien:", "_info_files"), ("Art / Weg:", "_info_kind"), ("Gitter / GSD:", "_info_grid"),
+                  ("Extent (X / Y):", "_info_extent"), ("Koordinatensys.:", "_info_crs")]
+        for row, (label, attr) in enumerate(fields):
+            lbl = ttk.Label(sec, text=label, font=("Segoe UI", 9, "bold"))
+            lbl.grid(row=row, column=0, sticky="nw", pady=1)
+            val = ttk.Label(sec, text="–", font=("Segoe UI", 9), wraplength=540, justify="left")
+            val.grid(row=row, column=1, sticky="w", padx=(8, 0), pady=1)
+            setattr(self, attr, val)
+            self._info_rows[attr] = (lbl, val)
+            app._accent_labels.append(val)
+        r = len(fields)
+        # Monospace-Zeilen: Metadaten, Vorschau (Einzelordner) bzw. Ordner-Liste (Batch)
+        for offset, (label, attr, wrap) in enumerate((("Metadaten\n1. Datei:", "_info_meta", 560),
+                                                      ("Vorschau:", "_info_preview", 0),
+                                                      ("Ordner:", "_info_batch", 560))):
+            lbl = ttk.Label(sec, text=label, font=("Segoe UI", 9, "bold"), justify="left")
+            lbl.grid(row=r + offset, column=0, sticky="nw", pady=(4, 1))
+            val = ttk.Label(sec, text="–", font=("Courier New", 8), justify="left", wraplength=wrap)
+            val.grid(row=r + offset, column=1, sticky="w", padx=(8, 0), pady=(4, 1))
+            setattr(self, attr, val)
+            self._info_rows[attr] = (lbl, val)
+            app._dim_labels.append(val)
+        self._info_warn = ttk.Label(sec, text="", font=("Segoe UI", 8, "italic"), wraplength=560, justify="left")
+        self._info_warn.grid(row=r + 3, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        self._info_warn.grid_remove()
+        app._hint_labels.append(self._info_warn)
+        ttk.Button(sec, text="Datei-Info aktualisieren", command=self._refresh_info
+                   ).grid(row=r + 4, column=0, columnspan=2, sticky="w", pady=(8, 0))
+
+    # ── 2 Projekt & Referenzsystem ────────────────────────────────────────────
+    def _build_projekt(self, parent):
+        sec = self._section(parent, "Projekt  (Benennung + CRS-Tag)")
+        self._batch_name_var = tk.StringVar(value="(je Ordner)")
+        self._bold(sec, "Jahr:", 0)
+        self._jahr_var = tk.StringVar()
+        self._jahr_entry = ttk.Entry(sec, textvariable=self._jahr_var, width=12)
+        self._jahr_entry.grid(row=0, column=1, sticky="w", padx=(8, 0), pady=3)
+        self._bold(sec, "AREA / AOI:", 1)
+        self._area_var = tk.StringVar()
+        self._area_entry = ttk.Entry(sec, textvariable=self._area_var, width=28)
+        self._area_entry.grid(row=1, column=1, sticky="w", padx=(8, 0), pady=3)
+        self._projekt_hint = self._hint(sec, "", 2)
+
+        self._bold(sec, "CRS / SRS:", 3, pady=(8, 3))
+        crs = ttk.Label(sec, text=SBDSM_CRS_LABEL, font=("Segoe UI", 9))
+        crs.grid(row=3, column=1, sticky="w", padx=(8, 0), pady=(8, 3))
+        self.app._accent_labels.append(crs)
+        self._hint(sec, "Der GDWH-Import SB_DSM akzeptiert nur LV95 + LN02 (Hillshade: EPSG:2056). Nur CRS-Tag – "
+                        "Koordinaten und Hoehen werden NICHT umgerechnet;\nLHN95-Daten zuerst mit GeoSuite/REFRAME "
+                        "nach LN02 transformieren. Die CRS-Angabe im Dateinamen wird ignoriert (nur Warnung).", 4)
+
+    def _height_ref(self) -> str:
+        return "LN02"
+
+    # ── 3 Output ───────────────────────────────────────────────────────────────
+    def _build_output(self, parent):
+        sec = self._section(parent, "DSM-Raster + Hillshade")
+        self._bold(sec, "Output-Ordner:", 0)
+        self._out_var = tk.StringVar()
+        self._batch_out_var = tk.StringVar(value="<Ordner>\\{}   (je Ordner der Liste)".format(self.BATCH_OUT))
+        self._out_entry = ttk.Entry(sec, textvariable=self._out_var)
+        self._out_entry.grid(row=0, column=1, sticky="ew", padx=(8, 4), pady=3)
+        self._out_btn = ttk.Button(sec, text="Ordner…", command=self._browse_output)
+        self._out_btn.grid(row=0, column=2, pady=3)
+        self._out_hint = self._hint(sec, "", 1)
+
+        self._bold(sec, "GSD [m]:", 2, pady=(8, 3))
+        self._gsd_var = tk.StringVar(value=DEFAULT_GSD)
+        self._gsd_entry = ttk.Entry(sec, textvariable=self._gsd_var, width=8)
+        self._gsd_entry.grid(row=2, column=1, sticky="w", padx=(8, 0), pady=(8, 3))
+        self._gsd_hint = self._hint(sec, "", 3)
+
+        ttk.Label(sec, text="Benennung:", font=("Segoe UI", 9, "bold")).grid(row=4, column=0, sticky="nw", pady=(10, 3))
+        self._name_preview_lbl = ttk.Label(sec, text="–", font=("Courier New", 9), justify="left")
+        self._name_preview_lbl.grid(row=4, column=1, columnspan=2, sticky="w", padx=(8, 0), pady=(10, 3))
+        self.app._accent_labels.append(self._name_preview_lbl)
+        self._hint(sec, "<Jahr>_<AREA>_DSM|hillshade_<GSD>_LV95_LN02.tif  –  GSD wie in den Lieferungen: 1m, 2m, 50cm …", 5)
+        self._hint(sec, "DSM: Float32, NoData -3.4028235e+38, EPSG:2056+5728  |  Hillshade: Byte, NoData 255, EPSG:2056\n"
+                        "Gitter: Werte 1:1, keine Interpolation, keine Lochfuellung  |  Punkte: IDW, Loecher ≤ 900 m² "
+                        "interpoliert  |  -9999 gilt immer als NoData", 6, column=0, columnspan=3, pady=(8, 0))
+
+    def _browse_output(self):
+        path = filedialog.askdirectory(title="Output-Ordner fuer DSM-Raster + Hillshade auswaehlen")
+        if path:
+            self._out_var.set(path.replace("/", "\\"))
+
+    def _set_mode(self, mode: str, grid_gsd=None):
+        """Weg aus der Datei-Info: bei 'grid' ist die GSD die Zellgroesse (fest), sonst waehlbar."""
+        self._mode = mode
+        self._grid_gsd = grid_gsd if mode == "grid" else None
+        if self._grid_gsd:
+            self._gsd_var.set("{:g}".format(self._grid_gsd))
+            self._gsd_entry.config(state="disabled")
+            self._gsd_hint.config(text="= Zellgroesse des Gitters (fest) – Werte werden 1:1 uebernommen")
+        else:
+            self._gsd_entry.config(state="normal")
+            batch = getattr(self, "_input_mode_var", None) is not None and self._is_batch()
+            self._gsd_hint.config(text=(
+                "Batch: Gitter = Zellgroesse je Ordner; XYZ-Punkte = GSD aus dem Dateinamen (z.B. _1m_), "
+                "nur ohne Angabe im Namen gilt dieser Wert" if batch else
+                "Nur fuer XYZ-Punkte (IDW), vorbelegt aus dem Dateinamen (z.B. _1m_)  |  "
+                "bei Gittern = Zellgroesse, wird erkannt"))
+        self._update_name_preview()
+
+    def _current_gsd(self):
+        if self._grid_gsd:
+            return self._grid_gsd
+        try:
+            gsd = float(self._gsd_var.get().replace(",", "."))
+        except ValueError:
+            return None
+        return gsd if gsd > 0 else None
+
+    def _update_name_preview(self):
+        if getattr(self, "_name_preview_lbl", None) is None:
+            return
+        try:
+            if getattr(self, "_input_mode_var", None) is not None and self._is_batch():
+                text = "\n".join("<Ordner>\\{}\\{}".format(self.BATCH_OUT, n)
+                                 for n in _raster_naming_preview("", "", None).splitlines())
+            else:
+                text = _raster_naming_preview(self._jahr_var.get(), self._area_var.get(), self._current_gsd())
+        except Exception as e:
+            text = "(Vorschau nicht moeglich: {})".format(e)
+        self._name_preview_lbl.config(text=text)
+
+    # ── Datei-Info ────────────────────────────────────────────────────────────
+    def _reset_info(self):
+        super()._reset_info()
+        if getattr(self, "_gsd_entry", None) is not None:
+            self._set_mode("")
+
+    def _info_cfg(self):
+        if not self._is_batch():
+            return super()._info_cfg()
+        path = self._list_var.get().strip()
+        if not path or not os.path.isfile(path):
+            return None
+        # GSD des GUI nur als Ersatz fuer XYZ-Punkte ohne GSD im Dateinamen
+        return {"action": "info", "format": "raster", "batch_list": path,
+                "gsd": self._current_gsd() or 0.0, "pdal_exe": self.app._pdal_exe}
+
+    @staticmethod
+    def _short_path(path: str, keep: int = 2) -> str:
+        parts = Path(path).parts
+        return path if len(parts) <= keep + 1 else "…\\" + "\\".join(parts[-keep:])
+
+    def _show_batch_info(self, info: dict):
+        """Batch: Vorab-Pruefung aller Ordner der Liste (je Ordner Art, GSD, Zielname oder Problem)."""
+        self._last_info = info
+        folders = info.get("folders") or []
+        n, n_ok = len(folders), info.get("n_ok", 0)
+        if not n:
+            self._info_files.config(text="(keine Ordner-Pfade in der Liste)")
+            return
+        self._info_files.config(text="{} Ordner in der Liste  |  {} bereit  |  {} mit Problem (werden "
+                                     "uebersprungen)".format(n, n_ok, n - n_ok))
+        self._info_kind.config(text=", ".join("{} × {}".format(c, k) for k, c in sorted(
+            (info.get("kinds") or {}).items())) + "  →  Weg je Ordner (Gitter 1:1 / Punkte IDW)")
+        rows, warnings, max_rows = [], [], 60
+        for i, p in enumerate(folders, 1):
+            if i <= max_rows:
+                rows.append("{:>3} {:<3} {}".format(i, "!!" if p["problem"] else "OK", self._short_path(p["path"])))
+                if p["problem"]:
+                    rows.append("        " + p["problem"])
+                else:
+                    rows.append("        {}, {:g} m ({}) → {}{}".format(
+                        p["kind"], p["gsd"], p["gsd_from"], p["names"][0],
+                        "  [vorhanden]" if p["existing"] else ""))
+            for w in p["warnings"]:
+                warnings.append("⚠  {}: {}".format(self._short_path(p["path"]), w))
+        if n > max_rows:
+            rows.append("    … +{} weitere Ordner (vollstaendige Liste im Log beim Lauf)".format(n - max_rows))
+        self._info_batch.config(text="\n".join(rows))
+        if n_ok < n:
+            warnings.insert(0, "⚠  {} Ordner mit Problem (!!) werden beim Lauf uebersprungen.".format(n - n_ok))
+        n_existing = sum(1 for p in folders if p["existing"])
+        if n_existing:
+            warnings.append("ℹ  {} Ordner haben DSM/Hillshade bereits in \\{} – wird ueberschrieben (Rueckfrage "
+                            "beim Start).".format(n_existing, self.BATCH_OUT))
+        if warnings:
+            self._info_warn.config(text="\n".join(warnings))
+            self._info_warn.grid()
+        else:
+            self._info_warn.grid_remove()
+        self._set_mode("")
+
+    def _show_info(self, info: dict):
+        if info.get("batch"):
+            self._show_batch_info(info)
+            return
+        T = DARK if self.app._dark else LIGHT
+        n = info.get("n_files", 0)
+        if not n:
+            text = "(keine ASCII-Dateien im Ordner)"
+            if info.get("n_las"):
+                text += "  –  {} LAZ/LAS-Datei(en): Tab '{}' verwenden".format(info["n_las"], TAB_LABELS["las"])
+            self._info_files.config(text=text)
+            self._set_mode("")
+            return
+        self._info_files.config(text="{} Datei(en), {:.1f} MB  |  z.B. {}".format(
+            n, info.get("size_mb", 0.0), info.get("sample", "")))
+        first_show = self._last_info is not info
+        self._last_info = info
+        runner = _runner_module()
+        warnings = ["⚠  " + e for e in info.get("errors") or []]
+        if info.get("n_las"):
+            warnings.append("ℹ  Ordner enthaelt auch {} LAZ/LAS-Datei(en) – dieser Tab verarbeitet nur ASCII."
+                            .format(info["n_las"]))
+
+        mode = info.get("mode", "")
+        kinds = ", ".join("{} × {}".format(c, runner.KIND_LABELS.get(k, k))
+                          for k, c in sorted((info.get("kinds") or {}).items()))
+        weg = {"grid": "Weg Gitter – Werte 1:1, GSD = Zellgroesse",
+               "points": "Weg Punkte – IDW mit gewaehlter GSD",
+               "mixed": "gemischt – nicht in EINEM Lauf moeglich"}.get(mode, "–")
+        self._info_kind.config(text="{}  →  {}".format(kinds or "–", weg),
+                               foreground=T["err"] if mode == "mixed" else T["accent"])
+        if mode == "mixed":
+            warnings.append("⚠  Der Ordner mischt verschiedene Arten – alle Dateien eines Ordners ergeben EIN "
+                            "Mosaik derselben Art. Dateien getrennt verarbeiten.")
+
+        cellsizes = info.get("cellsizes") or []
+        grid_gsd = None
+        if mode == "grid" and len(cellsizes) == 1:
+            grid_gsd = cellsizes[0]
+            text = "Zelle {:g} m".format(grid_gsd)
+            if info.get("grid_cells"):
+                text += "  |  Mosaik {} × {} Zellen".format(*info["grid_cells"])
+        elif mode == "grid":
+            text = "verschiedene Zellgroessen: " + ", ".join("{:g} m".format(c) for c in cellsizes)
+            warnings.append("⚠  Verschiedene Zellgroessen – kein gemeinsames Mosaik moeglich.")
+        elif mode == "points":
+            text = "unregelmaessige Punkte, ~{:,} (geschaetzt)  →  GSD waehlen".format(
+                int(info.get("count_estimate") or 0)).replace(",", "'")
+        else:
+            text = "–"
+        self._info_grid.config(text=text)
+
+        e = info.get("extent")
+        if e:
+            self._info_extent.config(text="{:.2f} – {:.2f}  /  {:.2f} – {:.2f}".format(e[0], e[2], e[1], e[3]))
+        elif info.get("first_xy"):
+            self._info_extent.config(text="1. Datenzeile:  {:.2f} / {:.2f}  (ganzer Extent erst beim Lauf)"
+                                     .format(*info["first_xy"]))
+        crs = info.get("crs_guess", "unbekannt")
+        self._info_crs.config(text={"LV95": "LV95 (EPSG:2056) – Koordinatenbereich plausibel",
+                                    "LV03": "LV03 (EPSG:21781) – NICHT unterstuetzt",
+                                    "GRAD": "Grad (geographisch) – NICHT unterstuetzt",
+                                    }.get(crs, "unbekannt – Koordinaten weder LV95 noch LV03"),
+                              foreground=T["accent"] if crs == "LV95" else T["err"])
+        if crs == "LV03":
+            warnings.append("⚠  Koordinaten liegen in LV03 – zuerst mit GeoSuite/REFRAME (FINELTRA) nach LV95 "
+                            "transformieren; dieses Tool transformiert bewusst nicht.")
+        warnings += ["⚠  " + p for p in info.get("set_problems") or []]
+        lhn95 = (info.get("vertical_tags") or {}).get("LHN95")
+        if lhn95:
+            warnings.append("⚠  {} Datei(en) im Dateinamen als LHN95 bezeichnet – SB_DSM verlangt LN02, die Hoehen "
+                            "werden NICHT umgerechnet. Zuerst mit GeoSuite/REFRAME nach LN02 transformieren!"
+                            .format(lhn95))
+        parts = info.get("name_parts") or {}
+        if grid_gsd and parts.get("gsd") and abs(parts["gsd"] - grid_gsd) > 1e-6:
+            warnings.append("ℹ  GSD im Dateinamen {:g} m, Zellgroesse {:g} m – das Raster erhaelt {:g} m."
+                            .format(parts["gsd"], grid_gsd, grid_gsd))
+
+        self._info_meta.config(text=self._format_meta(info.get("first_meta") or {}))
+        self._info_preview.config(text="\n".join(line[:90] for line in info.get("preview", [])))
+        if first_show:
+            # Vorbelegung aus dem Dateinamen, Eingaben des Benutzers bleiben
+            if parts.get("jahr") and not self._jahr_var.get().strip():
+                self._jahr_var.set(parts["jahr"])
+            if parts.get("area") and not self._area_var.get().strip():
+                self._area_var.set(parts["area"])
+            if mode == "points" and parts.get("gsd"):
+                self._gsd_var.set("{:g}".format(parts["gsd"]))
+        self._set_mode(mode, grid_gsd)
+
+        if warnings:
+            self._info_warn.config(text="\n".join(warnings))
+            self._info_warn.grid()
+        else:
+            self._info_warn.grid_remove()
+
+    # ── Validierung + Start ───────────────────────────────────────────────────
+    def _validate_batch(self) -> bool:
+        """Batch: Liste + aktuelle Vorab-Pruefung (Datei-Info) noetig; Rueckfrage bei uebersprungenen
+        Ordnern und bei vorhandenen Rastern."""
+        from tkinter import messagebox
+        app, errors = self.app, []
+        path = self._list_var.get().strip()
+        info = self._last_info if (self._last_info or {}).get("batch") else None
+        if not app._osgeo_python or not os.path.isfile(app._osgeo_python):
+            errors.append("OSGeo4W Python nicht gefunden.\n"
+                          "Bitte Pfad via 'Aendern…' festlegen  (z.B. C:\\OSGeo4W\\bin\\python3.exe).")
+        if not path:
+            errors.append("TXT-Liste fehlt.")
+        elif not os.path.isfile(path):
+            errors.append("TXT-Liste nicht gefunden:\n  {}".format(path))
+        elif info is None or os.path.normcase(info.get("list", "")) != os.path.normcase(path):
+            errors.append("Vorab-Pruefung der Liste fehlt – 'Datei-Info aktualisieren' klicken.")
+        elif abs(float(info.get("gsd") or 0.0) - (self._current_gsd() or 0.0)) > 1e-9:
+            errors.append("GSD seit der Vorab-Pruefung geaendert – 'Datei-Info aktualisieren' klicken "
+                          "(betrifft XYZ-Punkte ohne GSD im Dateinamen).")
+        try:
+            if int(self._workers_var.get()) < 1:
+                raise ValueError
+        except Exception:
+            errors.append("CPU-Kerne ungueltig.")
+        plans = (info or {}).get("folders") or []
+        ok = [p for p in plans if not p["problem"]]
+        if info is not None and not errors:
+            if not ok:
+                errors.append("Kein Ordner der Liste ist verarbeitbar – siehe Datei-Info.")
+            elif any(p["mode"] == "points" for p in ok) and (not app._pdal_exe or not os.path.isfile(app._pdal_exe)):
+                errors.append("pdal.exe nicht gefunden (fuer XYZ-Punkte noetig, Teil von OSGeo4W/QGIS).")
+        if errors:
+            messagebox.showerror("Eingabe-Fehler", "\n\n".join("• " + e for e in errors), parent=app)
+            return False
+        bad = [p for p in plans if p["problem"]]
+        if bad and not messagebox.askyesno(
+                "Ordner mit Problemen",
+                "{} von {} Ordnern werden uebersprungen:\n  {}{}\n\nDie uebrigen {} verarbeiten?".format(
+                    len(bad), len(plans), "\n  ".join("{} – {}".format(self._short_path(p["path"]), p["problem"])
+                                                      for p in bad[:10]),
+                    "\n  …" if len(bad) > 10 else "", len(ok)), parent=app):
+            return False
+        existing = [p for p in ok if p["existing"]]
+        if existing and not messagebox.askyesno(
+                "Raster vorhanden",
+                "In {} Ordner(n) existieren DSM/Hillshade bereits in \\{}:\n  {}{}\n\nUeberschreiben?".format(
+                    len(existing), self.BATCH_OUT, "\n  ".join(self._short_path(p["path"]) for p in existing[:10]),
+                    "\n  …" if len(existing) > 10 else ""), parent=app):
+            return False
+        return True
+
+    def _validate(self) -> bool:
+        if self._is_batch():
+            return self._validate_batch()
+        app = self.app
+        errors = []
+        inp, out = self._in_var.get().strip(), self._out_var.get().strip()
+        if not app._osgeo_python or not os.path.isfile(app._osgeo_python):
+            errors.append("OSGeo4W Python nicht gefunden.\n"
+                          "Bitte Pfad via 'Aendern…' festlegen  (z.B. C:\\OSGeo4W\\bin\\python3.exe).")
+        if self._mode != "grid" and (not app._pdal_exe or not os.path.isfile(app._pdal_exe)):
+            errors.append("pdal.exe nicht gefunden (fuer XYZ-Punkte noetig, Teil von OSGeo4W/QGIS).")
+        if not inp:
+            errors.append("Input-Ordner fehlt.")
+        elif not os.path.isdir(inp):
+            errors.append("Input-Ordner nicht gefunden:\n  {}".format(inp))
+        elif not _list_input_files(inp, "ascii"):
+            errors.append("Keine ASCII-Dateien im Input-Ordner:\n  {}".format(inp))
+        if not out:
+            errors.append("Raster-Output-Ordner fehlt.")
+        if self._mode == "mixed":
+            errors.append("Der Ordner mischt verschiedene Arten von ASCII-DSM – Dateien getrennt verarbeiten.")
+        errors += _runner_module()._sbdsm_name_problems(self._jahr_var.get(), self._area_var.get())
+        gsd = self._current_gsd()
+        if not gsd:
+            errors.append("Raster-Aufloesung (GSD): Zahl > 0 erwartet (z.B. 1 oder 0.5).")
+        try:
+            if int(self._workers_var.get()) < 1:
+                raise ValueError
+        except Exception:
+            errors.append("CPU-Kerne ungueltig.")
+
+        from tkinter import messagebox
+        if errors:
+            messagebox.showerror("Eingabe-Fehler", "\n\n".join("• " + e for e in errors), parent=app)
+            return False
+        names = _runner_module()._sbdsm_raster_names(self._jahr_var.get().strip(), self._area_var.get().strip(), gsd)
+        existing = [n for n in names if os.path.isfile(os.path.join(out, n))]
+        if existing and not messagebox.askyesno(
+                "Raster vorhanden",
+                "Im Raster-Output-Ordner existiert bereits:\n  {}\n\nUeberschreiben?".format("\n  ".join(existing)),
+                parent=app):
+            return False
+        return True
+
+    def _start(self):
+        if self.app._running or not self._validate():
+            return
+        if self._is_batch():
+            path = self._list_var.get().strip()
+            cfg = {
+                "action":       "raster",
+                "batch_list":   path,
+                "gsd":          self._current_gsd() or 0.0,   # nur XYZ-Punkte ohne GSD im Dateinamen
+                "staging_dir":  self._staging_var.get().strip(),
+                "num_workers":  int(self._workers_var.get()),
+                "keep_staging": bool(self._keep_var.get()),
+                "pdal_exe":     self.app._pdal_exe,
+            }
+            self.app._start_run(cfg, "BATCH_{}_DSM_LV95_LN02".format(Path(path).stem),
+                                TAB_LABELS[self.fmt] + " – Batch",
+                                "Batch abgeschlossen: alle Ordner verarbeitet.",
+                                "Batch: nicht alle Ordner verarbeitet (uebersprungen oder Fehler).\n"
+                                "Zusammenfassung am Ende der Log-Ausgabe.")
+            return
+        jahr, area = self._jahr_var.get().strip(), self._area_var.get().strip()
+        cfg = {
+            "action":       "raster",
+            "input_dir":    self._in_var.get().strip(),
+            "raster_dir":   self._out_var.get().strip(),
+            "jahr":         jahr,
+            "area":         area,
+            "gsd":          self._current_gsd(),   # nur Weg 'Punkte', bei Gittern gilt die Zellgroesse
+            "staging_dir":  self._staging_var.get().strip(),
+            "num_workers":  int(self._workers_var.get()),
+            "keep_staging": bool(self._keep_var.get()),
+            "pdal_exe":     self.app._pdal_exe,
+        }
+        self.app._start_run(cfg, _runner_module()._sbdsm_job_name(jahr, area), TAB_LABELS[self.fmt],
+                            "DSM-Raster + Hillshade erfolgreich erstellt.")
+
+
 # ─── Haupt-App ─────────────────────────────────────────────────────────────────
 class DsmToLazApp(tk.Tk):
 
     def __init__(self):
         super().__init__()
-        self.title("DSM ASCII/LAZ → LAZ-Tiles")
+        self.title("DSM ASCII/LAZ → LAZ-Tiles / DSM-Raster")
         screen_h = self.winfo_screenheight()
         win_h    = min(880, screen_h - 80)
         self.geometry(f"820x{win_h}")
@@ -853,6 +1428,9 @@ class DsmToLazApp(tk.Tk):
         self._log_q   = queue.Queue()
         self._ui_q    = queue.Queue()   # UI-Aufrufe aus Worker-Threads, abgearbeitet in _poll_log
         self._progress_start = None
+        self._run_title = ""
+        self._done_text = ""
+        self._fail_text = ""
 
         self._dim_labels    = []
         self._accent_labels = []
@@ -875,7 +1453,7 @@ class DsmToLazApp(tk.Tk):
         self._hdr = tk.Frame(self, height=52)
         self._hdr.pack(fill="x")
         self._hdr.pack_propagate(False)
-        self._hdr_lbl = tk.Label(self._hdr, text="DSM ASCII/LAZ → LAZ-Tiles",
+        self._hdr_lbl = tk.Label(self._hdr, text="DSM ASCII/LAZ → LAZ-Tiles / DSM-Raster",
                                   font=("Segoe UI", 15, "bold"))
         self._hdr_lbl.pack(side="left", padx=16, pady=12)
         self._theme_btn = tk.Button(self._hdr, text="Dark",
@@ -909,7 +1487,7 @@ class DsmToLazApp(tk.Tk):
         for fmt, label in TAB_LABELS.items():
             frame = ttk.Frame(self._notebook)
             self._notebook.add(frame, text=label)
-            self._tabs[fmt] = TilesTab(self, frame, fmt)
+            self._tabs[fmt] = (RasterTab if fmt == "raster" else TilesTab)(self, frame, fmt)
 
         # Log
         ttk.Separator(self).pack(fill="x", padx=12, pady=4)
@@ -1048,6 +1626,8 @@ class DsmToLazApp(tk.Tk):
         s.configure("TLabel",  background=T["panel"], foreground=T["fg"])
         s.configure("TCheckbutton", background=T["panel"], foreground=T["fg"])
         s.map("TCheckbutton", background=[("active", T["panel"])])
+        s.configure("TRadiobutton", background=T["panel"], foreground=T["fg"])
+        s.map("TRadiobutton", background=[("active", T["panel"])])
         s.configure("TButton",
             background=T["btn"], foreground=T["fg"],
             bordercolor=T["sep"], relief="flat",
@@ -1193,18 +1773,21 @@ class DsmToLazApp(tk.Tk):
         self._set_start_buttons("normal")
         self._progress_bar.stop()
         self._progress_frame.pack_forget()
-        self._log("\n✔  LAZ-Kacheln erfolgreich erstellt.\n" if success
-                  else "\n✘  Verarbeitung fehlgeschlagen.\n")
+        self._log("\n✔  {}\n".format(self._done_text) if success
+                  else "\n✘  {}\n".format(self._fail_text.splitlines()[0]))
         from tkinter import messagebox
         if success:
-            messagebox.showinfo("LAZ-Tiles abgeschlossen",
-                                "LAZ-Kacheln erfolgreich erstellt.", parent=self)
+            messagebox.showinfo("{} – abgeschlossen".format(self._run_title), self._done_text, parent=self)
         else:
-            messagebox.showerror("LAZ-Tiles fehlgeschlagen",
-                                 "Verarbeitung ist fehlgeschlagen.\nDetails siehe Log-Ausgabe.", parent=self)
+            messagebox.showerror("{} – fehlgeschlagen".format(self._run_title), self._fail_text, parent=self)
 
     # ── Verarbeitung starten ──────────────────────────────────────────────────
-    def _start_run(self, cfg: dict, log_stem: str, title: str):
+    def _start_run(self, cfg: dict, log_stem: str, title: str,
+                   done_text: str = "LAZ-Kacheln erfolgreich erstellt.",
+                   fail_text: str = "Verarbeitung ist fehlgeschlagen.\nDetails siehe Log-Ausgabe."):
+        self._run_title = title
+        self._done_text = done_text
+        self._fail_text = fail_text
         self._running = True
         self._progress_start = None
         self._set_start_buttons("disabled")

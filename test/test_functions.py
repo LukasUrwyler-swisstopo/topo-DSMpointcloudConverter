@@ -198,7 +198,7 @@ def test_tabs_per_format(tmp_path):
     try:
         nb = app._notebook
         assert [nb.tab(t, "text") for t in nb.tabs()] == \
-            ["DSM.ascii → DSM.laz-Tiles", "DSM.laz → DSM.laz-Tiles"]
+            ["DSM.ascii → DSM.laz-Tiles", "DSM.laz → DSM.laz-Tiles", "DSM.ascii → DSM-Raster (SB_DSM)"]
         ascii_tab, las_tab = app._tabs["ascii"], app._tabs["las"]
         assert ascii_tab._ascii_sec.winfo_manager() == "pack"
         assert las_tab._ascii_sec is None
@@ -258,5 +258,248 @@ def test_tabs_per_format(tmp_path):
 
         app._set_start_buttons("disabled")
         assert all(str(t._start_btn.cget("state")) == "disabled" for t in app._tabs.values())
+    finally:
+        app.destroy()
+
+
+# ─── Raster-Tab (SB_DSM) ──────────────────────────────────────────────────────
+# Namensmuster aus topo-GDWHimport (GUI_GDWHimport.NAME_FORMAT_SPECS['SB_DSM']) - hier unabhaengig
+# vom Runner abgeschrieben, damit eine Aenderung dort auffaellt
+IMPORTER_SB_DSM = (r'^20\d{2}_.+_DSM_.*_LV95_LN02\.(tif|tiff|tfw)$',
+                   r'^20\d{2}_.+_hillshade_.*_LV95_LN02\.(tif|tiff)$')
+
+
+def test_sbdsm_naming():
+    import re
+    r = _runner()
+    assert [r._gsd_label(g) for g in (1, 2.0, 0.5, 0.25, 1.5, 0.125)] == \
+        ["1m", "2m", "50cm", "25cm", "150cm", "12.5cm"]
+    dsm, hs = r._sbdsm_raster_names("2014", "ALETSCH_MOOSFLUE", 1.0)
+    assert (dsm, hs) == ("2014_ALETSCH_MOOSFLUE_DSM_1m_LV95_LN02.tif",
+                         "2014_ALETSCH_MOOSFLUE_hillshade_1m_LV95_LN02.tif")
+    assert re.match(IMPORTER_SB_DSM[0], dsm, re.I) and re.match(IMPORTER_SB_DSM[1], hs, re.I)
+    # AREA wie der Import sie liest (zwischen Jahr und erstem _DSM / _hillshade)
+    assert re.search(r'20\d{2}_(.+?)_DSM', dsm).group(1) == re.search(r'20\d{2}_(.+?)_hillshade', hs).group(1) \
+        == "ALETSCH_MOOSFLUE"
+    assert tuple(p.pattern for p in r.SBDSM_NAME_PATTERNS) == IMPORTER_SB_DSM
+    assert r._sbdsm_job_name("2014", "X") == "2014_X_DSM_LV95_LN02"
+    assert r._sbdsm_name_problems("2014", "ALETSCH_MOOSFLUE") == []
+    assert r._sbdsm_name_problems("1999", "X")                    # Import erwartet 20xx
+    assert r._sbdsm_name_problems("2014", "")
+    assert r._sbdsm_name_problems("2014", "A B")
+    assert r._sbdsm_name_problems("2014", "X_DSM_Y")              # AREA wuerde abgeschnitten
+    assert r._sbdsm_name_problems("2014", "hillshade_X")          # DSM wuerde als Hillshade gelten
+    gui = _gui()
+    assert gui._raster_naming_preview("", "", None).splitlines() == [
+        "<Jahr>_<AREA>_DSM_<GSD>_LV95_LN02.tif", "<Jahr>_<AREA>_hillshade_<GSD>_LV95_LN02.tif"]
+
+
+def test_source_name_parts():
+    r = _runner()
+    assert r._source_name_parts("2014_ALETSCH_MOOSFLUE_DSM_1m_LV95_LN02_CIR_low.asc") == \
+        {"jahr": "2014", "area": "ALETSCH_MOOSFLUE", "gsd": 1.0}
+    assert r._source_name_parts("2016_SILVRETTA_DSM_50cm_LV95_LN02.xyz")["gsd"] == 0.5
+    assert r._source_name_parts("gebiet.xyz") == {"jahr": "", "area": "", "gsd": None}
+
+
+def test_ascii_kind(tmp_path):
+    r = _runner()
+    # ESRI-Kopf wie die Lieferungen (Grossbuchstaben, NODATA -9999.00)
+    p = tmp_path / "a.asc"
+    p.write_text("NCOLS        4\nNROWS        3\nXLLCORNER    2640121.00\nYLLCORNER    1132732.00\n"
+                 "CELLSIZE     1.0\nNODATA_VALUE -9999.00\n" + "-9999.00 1500.25 1500.50 1500.75\n" * 3)
+    k = r._ascii_kind(str(p))
+    assert k["kind"] == "esri" and k["cellsize"] == 1.0 and k["header"]["nodata"] == -9999.0
+    assert k["box"] == (2640121.0, 1132732.0, 2640125.0, 1132735.0) and k["header"]["header_lines"] == 6
+    p.write_text("ncols 2\nnrows 2\nxllcenter 2600000.25\nyllcenter 1200000.25\ncellsize 0.5\n1 2\n3 4\n")
+    assert r._ascii_kind(str(p))["box"] == (2600000.0, 1200000.0, 2600001.0, 1200001.0)
+    p.write_text("ncols 2\nnrows 2\ncellsize 0.5\n1 2\n3 4\n")
+    with pytest.raises(ValueError, match="unvollstaendig"):
+        r._ascii_kind(str(p))
+
+    # XYZ-Gitter zeilenweise (mit Luecke) und spaltenweise -> Gitter, Zufallspunkte -> Punkte
+    g = tmp_path / "g.xyz"
+    rows = ["%.2f %.2f 500.0" % (2600000 + 0.5 * c, 1200010 - 0.5 * r_) for r_ in range(20) for c in range(30)
+            if (r_, c) != (5, 7)]
+    g.write_text("X Y Z\n" + "\n".join(rows) + "\n")
+    assert r._ascii_kind(str(g))["kind"] == "xyz_grid" and r._ascii_kind(str(g))["cellsize"] == 0.5
+    g.write_text("\n".join("%.2f;%.2f;500" % (2600000 + 2 * c, 1200000 + 2 * r_)
+                           for c in range(10) for r_ in range(40)) + "\n")
+    assert r._ascii_kind(str(g))["cellsize"] == 2.0
+    import random
+    rnd = random.Random(3)
+    g.write_text("".join("%.2f %.2f 500\n" % (2600000 + rnd.random() * 100, 1200000 + rnd.random() * 100)
+                         for _ in range(500)))
+    assert r._ascii_kind(str(g))["kind"] == "points"
+
+
+def test_grid_set_check():
+    r = _runner()
+    a = ((2600000.0, 1200000.0, 2600100.0, 1200050.0), 1.0, 1.0)
+    ok, cs, union = r._grid_set_check({"a": a, "b": ((2600100.0, 1200010.0, 2600160.0, 1200080.0), 1.0, 1.0)})
+    assert ok == [] and cs == 1.0 and union == (2600000.0, 1200000.0, 2600160.0, 1200080.0)
+    probs = lambda b: r._grid_set_check({"a": a, "b": b})[0]
+    assert "ueberlappen" in probs(((2600050.0, 1200000.0, 2600150.0, 1200050.0), 1.0, 1.0))[0]
+    assert "verschoben" in probs(((2600100.5, 1200000.0, 2600200.5, 1200050.0), 1.0, 1.0))[0]
+    assert "Zellgroesse" in probs(((2600100.0, 1200000.0, 2600200.0, 1200050.0), 0.5, 0.5))[0]
+    assert "nicht LV95" in r._grid_set_check({"a": ((600000.0, 200000.0, 600100.0, 200050.0), 1.0, 1.0)})[0][0]
+
+
+def test_raster_tab():
+    gui = _gui()
+    app = gui.DsmToLazApp()
+    try:
+        tab = app._tabs["raster"]
+        headers = [w.cget("text") for w in tab._sf.winfo_children()
+                   if isinstance(w, gui.ttk.Label) and w.cget("text")[:1].isdigit()]
+        assert headers == ["1   Input", "2   Projekt & Referenzsystem", "3   Output",
+                           "4   Staging & Parallelisierung"]
+        assert tab._height_ref() == "LN02" and not hasattr(tab, "_height_label_var")   # fix, keine Auswahl
+        assert tab._name_preview_lbl.cget("text").startswith("<Jahr>_<AREA>_DSM_50cm_LV95_LN02.tif")
+
+        # Gitter: GSD = Zellgroesse (gesperrt), Jahr/AREA aus dem Dateinamen vorbelegt
+        info = {"format": "raster", "n_files": 1, "n_ascii": 1, "n_las": 0, "sample": "x.asc", "size_mb": 1.0,
+                "kinds": {"esri": 1}, "mode": "grid", "cellsizes": [1.0], "grid_cells": [12000, 13057],
+                "extent": [2640121.0, 1132732.0, 2652121.0, 1145789.0], "crs_guess": "LV95", "set_problems": [],
+                "vertical_tags": {"LN02": 1}, "errors": [],
+                "name_parts": {"jahr": "2014", "area": "ALETSCH_MOOSFLUE", "gsd": 1.0},
+                "preview": ["NCOLS        12000"], "first_meta": {"file": "x.asc", "nodata": "-9999"}}
+        tab._show_info(info)
+        assert (tab._jahr_var.get(), tab._area_var.get()) == ("2014", "ALETSCH_MOOSFLUE")
+        assert str(tab._gsd_entry.cget("state")) == "disabled" and tab._current_gsd() == 1.0
+        assert tab._name_preview_lbl.cget("text").splitlines() == [
+            "2014_ALETSCH_MOOSFLUE_DSM_1m_LV95_LN02.tif", "2014_ALETSCH_MOOSFLUE_hillshade_1m_LV95_LN02.tif"]
+        assert not tab._info_warn.winfo_manager()
+        assert "NoData      : -9999" in tab._info_meta.cget("text")
+
+        # Punkte: GSD waehlbar, aus dem Namen vorbelegt; LHN95 im Namen -> Warnung; Eingaben bleiben
+        tab._area_var.set("MEIN_GEBIET")
+        info2 = dict(info, kinds={"points": 1}, mode="points", cellsizes=[], extent=None, grid_cells=None,
+                     first_xy=[2600000.0, 1200000.0], count_estimate=123456, vertical_tags={"LHN95": 1},
+                     name_parts={"jahr": "2014", "area": "X", "gsd": 2.0})
+        tab._show_info(info2)
+        assert str(tab._gsd_entry.cget("state")) == "normal" and tab._current_gsd() == 2.0
+        assert tab._area_var.get() == "MEIN_GEBIET"
+        assert "LHN95" in tab._info_warn.cget("text")
+        tab._show_info(dict(info2, mode="mixed", kinds={"esri": 1, "points": 1}))
+        assert "mischt" in tab._info_warn.cget("text")
+    finally:
+        app.destroy()
+
+
+# ─── Raster-Tab Batch (TXT-Liste mit Ordner-Pfaden) ──────────────────────────
+def _esri(path, x0=2640000.0, y0=1132000.0, n=4, cs=1.0):
+    path.write_text("NCOLS {0}\nNROWS {0}\nXLLCORNER {1:.2f}\nYLLCORNER {2:.2f}\nCELLSIZE {3}\nNODATA_VALUE -9999\n"
+                    .format(n, x0, y0, cs) + ("1500.25 " * n + "\n") * n)
+
+
+def test_read_batch_list(tmp_path):
+    r = _runner()
+    (tmp_path / "rel").mkdir()
+    lst = tmp_path / "liste.txt"
+    a, zh = str(tmp_path / "a"), r"C:\Zürich\b"
+    lines = ["# Kommentar", "", '"{}"'.format(a), "  {}  ".format(a), "rel", zh]
+    lst.write_bytes("\n".join(lines).encode("cp1252"))
+    folders = r._read_batch_list(str(lst))
+    assert folders == [os.path.normpath(a), os.path.normpath(str(tmp_path / "rel")),
+                       os.path.normpath(zh)]                                   # cp1252, Duplikat einmal
+    lst.write_text("\ufeff{}\n".format(tmp_path / "a"), encoding="utf-8")      # UTF-8 mit BOM
+    assert r._read_batch_list(str(lst)) == [os.path.normpath(str(tmp_path / "a"))]
+
+
+def test_batch_plan(tmp_path):
+    r = _runner()
+    ok = tmp_path / "ok"
+    ok.mkdir()
+    _esri(ok / "2014_ALETSCH_MOOSFLUE_DSM_1m_LV95_LN02_CIR_low.asc")
+    p = r._batch_plan(str(ok))
+    assert (p["problem"], p["mode"], p["jahr"], p["area"], p["gsd"], p["name_from"]) == \
+        ("", "grid", "2014", "ALETSCH_MOOSFLUE", 1.0, "Dateiname")
+    assert p["out_dir"] == str(ok / "dsm") and p["names"][0] == "2014_ALETSCH_MOOSFLUE_DSM_1m_LV95_LN02.tif"
+    (ok / "dsm").mkdir()
+    (ok / "dsm" / p["names"][0]).write_bytes(b"")
+    assert r._batch_plan(str(ok))["existing"] == [p["names"][0]]
+
+    # Jahr/AREA aus dem Ordnernamen, wenn der Dateiname nichts hergibt
+    named = tmp_path / "2019_GLETSCH_DSM_50cm"
+    named.mkdir()
+    _esri(named / "kachel.ascii", cs=0.5)
+    p = r._batch_plan(str(named))
+    assert (p["problem"], p["jahr"], p["area"], p["gsd"], p["name_from"]) == ("", "2019", "GLETSCH", 0.5, "Ordnername")
+
+    # Probleme -> Ordner wird uebersprungen
+    assert r._batch_plan(str(tmp_path / "fehlt"))["problem"] == "Ordner nicht gefunden"
+    empty = tmp_path / "leer"
+    empty.mkdir()
+    assert "keine ASCII-Dateien" in r._batch_plan(str(empty))["problem"]
+    noname = tmp_path / "ohne"
+    noname.mkdir()
+    _esri(noname / "a.asc")
+    assert "weder aus dem Dateinamen" in r._batch_plan(str(noname))["problem"]
+    two = tmp_path / "zwei"
+    two.mkdir()
+    _esri(two / "2014_A_DSM_1m.asc")
+    _esri(two / "2015_B_DSM_1m.asc", x0=2640004.0)
+    assert "verschiedene Jahr/AREA" in r._batch_plan(str(two))["problem"]
+    over = tmp_path / "ueber"
+    over.mkdir()
+    _esri(over / "2014_A_DSM_1m_1.asc")
+    _esri(over / "2014_A_DSM_1m_2.asc", x0=2640001.0)
+    assert "ueberlappen" in r._batch_plan(str(over))["problem"]
+
+    # XYZ-Punkte: GSD aus dem Namen, sonst GUI-Wert, sonst Problem
+    pts = tmp_path / "pts"
+    pts.mkdir()
+    import random
+    rnd = random.Random(1)
+    (pts / "2021_PTS_DSM.xyz").write_text("".join("%.2f %.2f 500\n" % (2600000 + rnd.random() * 50,
+                                                                     1200000 + rnd.random() * 50) for _ in range(300)))
+    assert "ohne GSD" in r._batch_plan(str(pts))["problem"]
+    p = r._batch_plan(str(pts), 2.0)
+    assert (p["problem"], p["mode"], p["gsd"], p["gsd_from"]) == ("", "points", 2.0, "GUI")
+
+
+def test_raster_tab_batch(tmp_path):
+    gui = _gui()
+    app = gui.DsmToLazApp()
+    try:
+        tab = app._tabs["raster"]
+        assert not tab._is_batch() and str(tab._out_entry.cget("state")) == "normal"
+        tab._out_var.set(r"D:\raster")
+        tab._jahr_var.set("2014")
+        tab._input_mode_var.set("batch")
+        tab._on_input_mode(refresh=False)
+        # Output-Ordner und Jahr/AREA ausgegraut, Werte des Einzellaufs bleiben erhalten
+        assert str(tab._out_entry.cget("state")) == "disabled" and str(tab._out_btn.cget("state")) == "disabled"
+        assert str(tab._jahr_entry.cget("state")) == "disabled" and str(tab._area_entry.cget("state")) == "disabled"
+        assert tab._batch_widgets[1].winfo_manager() == "grid" and not tab._single_widgets[1].winfo_manager()
+        assert tab._info_batch.winfo_manager() == "grid" and not tab._info_meta.winfo_manager()
+        assert tab._name_preview_lbl.cget("text").startswith(r"<Ordner>\dsm\<Jahr>_<AREA>_DSM_<GSD>_LV95_LN02.tif")
+        lst = tmp_path / "liste.txt"
+        lst.write_text("C:\\x\n")
+        tab._list_var.set(str(lst))
+        cfg = tab._info_cfg()
+        assert cfg["batch_list"] == str(lst) and cfg["format"] == "raster"
+
+        info = {"format": "raster", "batch": True, "list": str(lst), "n_folders": 2, "n_ok": 1,
+                "kinds": {"ESRI-ASCII-Grid": 1},
+                "folders": [
+                    {"path": r"D:\daten\2014\ALETSCH", "problem": "", "warnings": ["GSD im Dateinamen 2 m"],
+                     "kind": "ESRI-ASCII-Grid", "mode": "grid", "gsd": 1.0, "gsd_from": "Zellgroesse",
+                     "names": ["2014_ALETSCH_DSM_1m_LV95_LN02.tif", "2014_ALETSCH_hillshade_1m_LV95_LN02.tif"],
+                     "existing": ["2014_ALETSCH_DSM_1m_LV95_LN02.tif"]},
+                    {"path": r"D:\daten\RHONE", "problem": "keine ASCII-Dateien", "warnings": [], "kind": "",
+                     "mode": "", "gsd": None, "gsd_from": "", "names": [], "existing": []}]}
+        tab._show_info(info)
+        table = tab._info_batch.cget("text")
+        assert r"OK  …\2014\ALETSCH" in table and "→ 2014_ALETSCH_DSM_1m_LV95_LN02.tif  [vorhanden]" in table
+        assert r"!!  D:\daten\RHONE" in table and "keine ASCII-Dateien" in table   # kurzer Pfad ganz
+        warn = tab._info_warn.cget("text")
+        assert "1 Ordner mit Problem" in warn and "GSD im Dateinamen 2 m" in warn and "ueberschrieben" in warn
+
+        tab._input_mode_var.set("single")
+        tab._on_input_mode(refresh=False)
+        assert tab._out_entry.get() == r"D:\raster" and tab._jahr_entry.get() == "2014"
+        assert str(tab._out_entry.cget("state")) == "normal" and tab._info_meta.winfo_manager() == "grid"
     finally:
         app.destroy()

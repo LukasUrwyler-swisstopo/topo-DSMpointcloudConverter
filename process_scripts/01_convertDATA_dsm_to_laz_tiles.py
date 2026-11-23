@@ -1,8 +1,9 @@
 """
-DSM ASCII/LAZ -> LAZ-Kacheln (Grid-Shape, z.B. swissGRID 1km2) - Standalone ohne GUI
+DSM ASCII/LAZ -> LAZ-Kacheln (Grid-Shape, z.B. swissGRID 1km2) bzw. ASCII-DSM -> DSM-Raster
+fuer SB_DSM - Standalone ohne GUI
 -------------------------------------------------------------------------------------
-Nutzt exakt dieselbe Verarbeitung wie das GUI (_osgeo_runner._process), es gibt
-keine zweite Implementierung. Konfiguration unten anpassen.
+Nutzt exakt dieselbe Verarbeitung wie das GUI (_osgeo_runner._process bzw. _process_raster),
+es gibt keine zweite Implementierung. ACTION und Konfiguration unten anpassen.
 
 Anforderungen:
     OSGeo4W- oder QGIS-Python (osgeo/ogr) + pdal.exe (Teil von OSGeo4W/QGIS)
@@ -20,6 +21,8 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 # ---------------------------------------------------------------------------
 # Konfiguration – hier anpassen
 # ---------------------------------------------------------------------------
+ACTION = "process"   # "process" = LAZ-Kacheln (CONFIG) | "raster" = DSM-Raster SB_DSM (RASTER_CONFIG)
+
 CONFIG = {
     "input_dir":       r"C:\pfad\zum\input",            # Ordner mit .xyz/.txt/.asc/.csv oder .laz/.las (beliebiges Tiling / merged)
     "output_dir":      r"C:\pfad\zum\output",           # muss ein anderer Ordner als input_dir sein
@@ -45,6 +48,23 @@ CONFIG = {
     "keep_staging":    False,
 }
 
+# ASCII-DSM eines Gebiets (ESRI-ASCII-Grid / XYZ-Gitter / XYZ-Punkte, wird erkannt) -> DSM + Hillshade
+# <jahr>_<area>_DSM|hillshade_<GSD>_LV95_LN02.tif (+ .tfw), fix LV95/LN02, alle Dateien = EIN Mosaik.
+# Gitter: Werte 1:1, GSD = Zellgroesse | Punkte: IDW mit "gsd", Loecher <= 900 m2 interpoliert.
+# Batch: "batch_list" = TXT mit einem Ordner-Pfad je Zeile -> je Ordner <Ordner>\dsm, Jahr/AREA aus dem
+# Dateinamen (sonst Ordnername); input_dir/raster_dir/jahr/area werden dann ignoriert.
+RASTER_CONFIG = {
+    "batch_list":      r"",          # leer = Einzellauf mit input_dir/raster_dir
+    "input_dir":       r"C:\pfad\zum\input",            # Ordner mit .asc/.ascii/.xyz/.txt/.csv
+    "raster_dir":      r"C:\pfad\zum\output",           # Output-Ordner DSM + Hillshade
+    "jahr":            "",           # 20xx, z.B. "2014"
+    "area":            "",           # z.B. "ALETSCH_MOOSFLUE" (ohne Namensteil DSM/hillshade/LV95)
+    "gsd":             1.0,          # nur XYZ-Punkte (IDW; Batch: nur ohne GSD im Dateinamen); Gitter = Zellgroesse
+    "staging_dir":     "",           # leer = <raster_dir>\_staging
+    "num_workers":     4,
+    "keep_staging":    False,
+}
+
 
 def _load_runner():
     spec = importlib.util.spec_from_file_location("_osgeo_runner", str(SCRIPT_DIR / "_osgeo_runner.py"))
@@ -55,7 +75,13 @@ def _load_runner():
 
 if __name__ == "__main__":
     try:
-        _load_runner()._process(CONFIG)
+        runner = _load_runner()
+        if ACTION == "raster" and RASTER_CONFIG.get("batch_list"):
+            runner._process_raster_batch(RASTER_CONFIG)
+        elif ACTION == "raster":
+            runner._process_raster(RASTER_CONFIG)
+        else:
+            runner._process(CONFIG)
     except Exception as exc:
         print(f"[FEHLER] {exc}", flush=True)
         sys.exit(1)
