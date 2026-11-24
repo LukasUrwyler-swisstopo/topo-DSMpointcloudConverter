@@ -5,7 +5,8 @@ Grid-Shape (z.B. swissGRID 1km²) um – optional ausgedünnt und mit DSM-Raster
 dritter Tab macht aus einem ASCII-DSM direkt **DSM + Hillshade für den GDWH-Import `SB_DSM`**, ohne
 Kacheln. Struktur und Styling analog zu `topo-COGTIFFconverter` und `topo-DMCdataConverter`.
 
-<img width="935" height="991" alt="image" src="https://github.com/user-attachments/assets/bff725dc-a395-4984-b899-04a3027d4e68" />
+<img width="834" height="892" alt="image" src="https://github.com/user-attachments/assets/cba723e0-6aae-4dcd-86f8-64d33f94cd02" />
+
 
 
 | Tab | Input | Output |
